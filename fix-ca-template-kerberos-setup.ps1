@@ -29,25 +29,25 @@
 [CmdletBinding()]
 param(
     [string]$ServerOu =
-        'OU=SQL,OU=Servers,DC=compy,DC=local',
+        'OU=SharePoint,OU=Servers,DC=compy,DC=local',
 
     # Existing certificate template display name or internal name.
     [string]$TemplateName =
         'Ansible WinRM HTTPS',
 
     [string]$EnrollmentGroupName =
-        'WinRM HTTPS SQL Servers',
+        'WinRM HTTPS SharePoint Servers',
 
     # Must be 20 characters or fewer.
     [ValidateLength(1, 20)]
     [string]$EnrollmentGroupSamAccountName =
-        'WinRMHTTPS-SQL',
+        'WinRMHTTPS-SP',
 
     # Leave empty to create the group in the domain's default Users container.
     [string]$EnrollmentGroupPath = '',
 
     [string]$AutoEnrollmentGpoName =
-        'SQL Servers - Certificate Auto-Enrollment',
+        'SharePoint Servers - Certificate Auto-Enrollment',
 
     [ValidateRange(2048, 16384)]
     [int]$MinimumKeySize = 2048,
@@ -108,12 +108,7 @@ function ConvertTo-LdapFilterValue {
         [string]$Value
     )
 
-    return $Value.
-        Replace('\', '\5c').
-        Replace('*', '\2a').
-        Replace('(', '\28').
-        Replace(')', '\29').
-        Replace([char]0, '\00')
+    return $Value.Replace('\', '\5c').Replace('*', '\2a').Replace('(', '\28').Replace(')', '\29').Replace([char]0, '\00')
 }
 
 function Get-DomainInformation {
@@ -289,12 +284,12 @@ function Get-TemplateDirectoryEntry {
     ) -join ','
 
     $searchRoot =
-        New-Object System.DirectoryServices.DirectoryEntry(
+        [System.DirectoryServices.DirectoryEntry]::new(
             "LDAP://$containerDn"
         )
 
     $searcher =
-        New-Object System.DirectoryServices.DirectorySearcher(
+        [System.DirectoryServices.DirectorySearcher]::new(
             $searchRoot
         )
 
@@ -398,11 +393,11 @@ function Set-TemplateEnrollmentPermissions {
 
     # Certificate-Enrollment extended right.
     $enrollGuid =
-        New-Object Guid '0e10c968-78fb-11d2-90d4-00c04f79dc55'
+        [Guid]::new('0e10c968-78fb-11d2-90d4-00c04f79dc55')
 
     # Certificate-AutoEnrollment extended right.
     $autoEnrollGuid =
-        New-Object Guid 'a05b8cc2-17bc-4802-a710-e7c15ab866a2'
+        [Guid]::new('a05b8cc2-17bc-4802-a710-e7c15ab866a2')
 
     $allow =
         [System.Security.AccessControl.AccessControlType]::Allow
@@ -426,14 +421,14 @@ function Set-TemplateEnrollmentPermissions {
     }
 
     $readRule =
-        New-Object System.DirectoryServices.ActiveDirectoryAccessRule(
+        [System.DirectoryServices.ActiveDirectoryAccessRule]::new(
             $GroupSid,
             [System.DirectoryServices.ActiveDirectoryRights]::GenericRead,
             $allow
         )
 
     $enrollRule =
-        New-Object System.DirectoryServices.ActiveDirectoryAccessRule(
+        [System.DirectoryServices.ActiveDirectoryAccessRule]::new(
             $GroupSid,
             [System.DirectoryServices.ActiveDirectoryRights]::ExtendedRight,
             $allow,
@@ -441,7 +436,7 @@ function Set-TemplateEnrollmentPermissions {
         )
 
     $autoEnrollRule =
-        New-Object System.DirectoryServices.ActiveDirectoryAccessRule(
+        [System.DirectoryServices.ActiveDirectoryAccessRule]::new(
             $GroupSid,
             [System.DirectoryServices.ActiveDirectoryRights]::ExtendedRight,
             $allow,
@@ -698,7 +693,7 @@ try {
         -SamAccountName $EnrollmentGroupSamAccountName `
         -Path $EnrollmentGroupPath
 
-    Write-Step 'Synchronizing SQL OU computers into the enrollment group'
+    Write-Step 'Synchronizing SharePoint OU computers into the enrollment group'
 
     $targetComputers = Sync-OuComputersToGroup `
         -SearchBase $ServerOu `
@@ -722,7 +717,7 @@ try {
     Write-Step 'Repairing certificate template settings and permissions'
 
     $groupSid =
-        New-Object System.Security.Principal.SecurityIdentifier(
+        [System.Security.Principal.SecurityIdentifier]::new(
             $enrollmentGroup.SID.Value
         )
 
