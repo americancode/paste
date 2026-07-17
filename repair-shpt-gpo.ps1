@@ -210,10 +210,41 @@ $details
         -PassThru `
         -ErrorAction Stop
 
-    return Get-ADGroup `
-        -Identity $newGroup.DistinguishedName `
-        -Properties SID, DisplayName, SamAccountName `
-        -ErrorAction Stop
+    if ($null -eq $newGroup) {
+        throw "The enrollment group creation returned no object."
+    }
+
+    if ($null -eq $newGroup.SID) {
+        $createdDn = ConvertTo-LdapFilterValue `
+            -Value $newGroup.DistinguishedName
+
+        $createdMatches = @(
+            Get-ADObject `
+                -LDAPFilter "(&(objectClass=group)(distinguishedName=$createdDn))" `
+                -SearchBase $groupPath `
+                -SearchScope Subtree `
+                -Properties objectSid, displayName, sAMAccountName `
+                -ErrorAction Stop
+        )
+
+        if ($createdMatches.Count -ne 1) {
+            throw "The enrollment group was created but could not be re-read by LDAP."
+        }
+
+        $newGroup = [pscustomobject]@{
+            Name              = $createdMatches[0].Name
+            DisplayName       = $createdMatches[0].DisplayName
+            SamAccountName    = $createdMatches[0].SamAccountName
+            DistinguishedName = $createdMatches[0].DistinguishedName
+            SID               = New-Object System.Security.Principal.SecurityIdentifier `
+                                    -ArgumentList @(
+                                        [byte[]]$createdMatches[0].objectSid,
+                                        0
+                                    )
+        }
+    }
+
+    return $newGroup
 }
 
 function Ensure-TemplatePermissions {
