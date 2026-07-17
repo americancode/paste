@@ -1,7 +1,7 @@
 #requires -Version 5.1
 #requires -RunAsAdministrator
 
-# Rebuilt 2026-07-17: SharePoint edition; corrected LDAP escaping.
+# Rebuilt v3 2026-07-17: SharePoint edition; creates the custom template when missing.
 
 <#
 .SYNOPSIS
@@ -14,7 +14,9 @@
     template, publishes it on the local Enterprise CA, and creates/links a
     computer certificate auto-enrollment GPO.
 
-    The certificate template must already exist in Active Directory.
+    If the custom template does not exist, the script duplicates the built-in
+    Web Server template directly in Active Directory and then applies the
+    required WinRM HTTPS settings and permissions.
 
 .NOTES
     Run from an elevated Windows PowerShell 5.1 console on the Enterprise CA
@@ -30,6 +32,17 @@ param(
     [Parameter()]
     [ValidateNotNullOrEmpty()]
     [string]$TemplateName = 'Ansible WinRM HTTPS',
+
+    [Parameter()]
+    [ValidatePattern('^[A-Za-z0-9_-]+$')]
+    [string]$TemplateInternalName = 'AnsibleWinRMHTTPS',
+
+    [Parameter()]
+    [ValidateNotNullOrEmpty()]
+    [string]$BaseTemplateName = 'WebServer',
+
+    [Parameter()]
+    [bool]$CreateTemplateIfMissing = $true,
 
     [Parameter()]
     [ValidateNotNullOrEmpty()]
@@ -228,13 +241,16 @@ function Sync-OuComputersToGroup {
     return $computers
 }
 
-function Get-TemplateDirectoryEntry {
-    param([Parameter(Mandatory = $true)][string]$Name)
-
+function Get-CertificateTemplateContainerDn {
     $rootDse = [ADSI]'LDAP://RootDSE'
     $configurationNc = [string]$rootDse.configurationNamingContext
-    $containerDn = "CN=Certificate Templates,CN=Public Key Services,CN=Services,$configurationNc"
+    return "CN=Certificate Templates,CN=Public Key Services,CN=Services,$configurationNc"
+}
 
+function Find-TemplateDirectoryEntry {
+    param([Parameter(Mandatory = $true)][string]$Name)
+
+    $containerDn = Get-CertificateTemplateContainerDn
     $searchRoot = New-Object -TypeName System.DirectoryServices.DirectoryEntry -ArgumentList "LDAP://$containerDn"
     $searcher = New-Object -TypeName System.DirectoryServices.DirectorySearcher -ArgumentList $searchRoot
 
@@ -245,7 +261,7 @@ function Get-TemplateDirectoryEntry {
         $result = $searcher.FindOne()
 
         if ($null -eq $result) {
-            throw "Certificate template '$Name' was not found in Active Directory. Create or duplicate it in certtmpl.msc, then rerun this script."
+            return $null
         }
 
         return $result.GetDirectoryEntry()
@@ -254,6 +270,151 @@ function Get-TemplateDirectoryEntry {
         $searcher.Dispose()
         $searchRoot.Dispose()
     }
+}
+
+function New-UniqueCertificateTemplateOid {
+    param([Parameter(Mandatory = $true)][string]$BaseOid)
+
+    $containerDn = Get-CertificateTemplateContainerDn
+
+    do {
+        $randomArc1 = Get-Random -Minimum 10000000 -Maximum 2147483647
+        $randomArc2 = Get-Random -Minimum 10000000 -Maximum 2147483647
+        $candidate = "$BaseOid.$randomArc1.$randomArc2"
+        $escapedOid = ConvertTo-LdapFilterValue -Value $candidate
+
+        $searchRoot = New-Object -TypeName System.DirectoryServices.DirectoryEntry -ArgumentList "LDAP://$containerDn"
+        $searcher = New-Object -TypeName System.DirectoryServices.DirectorySearcher -ArgumentList $searchRoot
+        try {
+            $searcher.Filter = "(&(objectClass=pKICertificateTemplate)(msPKI-Cert-Template-OID=$escapedOid))"
+            $exists = $null -ne $searcher.FindOne()
+        }
+        finally {
+            $searcher.Dispose()
+            $searchRoot.Dispose()
+        }
+    } while ($exists)
+
+    return $candidate
+}
+
+function New-CertificateTemplateFromBase {
+    param(
+        [Parameter(Mandatory = $true)][string]$BaseName,
+        [Parameter(Mandatory = $true)][string]$InternalName,
+        [Parameter(Mandatory = $true)][string]$DisplayName
+    )
+
+    $baseTemplate = Find-TemplateDirectoryEntry -Name $BaseName
+    if ($null -eq $baseTemplate) {
+        throw "Base certificate template '$BaseName' was not found. Verify the built-in Web Server template exists in certtmpl.msc."
+    }
+
+    $existingInternal = Find-TemplateDirectoryEntry -Name $InternalName
+    if ($null -ne $existingInternal) {
+        return $existingInternal
+    }
+
+    $containerDn = Get-CertificateTemplateContainerDn
+    $container = New-Object -TypeName System.DirectoryServices.DirectoryEntry -ArgumentList "LDAP://$containerDn"
+
+    # Attributes maintained by AD or unique to the new object are not copied.
+    $excludedProperties = @(
+        'adspath', 'allowedattributes', 'allowedattributeseffective',
+        'allowedchildclasses', 'allowedchildclasseseffective', 'canonicalname',
+        'cn', 'createTimeStamp', 'distinguishedName', 'dSCorePropagationData',
+        'instanceType', 'isCriticalSystemObject', 'modifyTimeStamp', 'name',
+        'nTSecurityDescriptor', 'objectCategory', 'objectClass', 'objectGUID',
+        'uSNChanged', 'uSNCreated', 'whenChanged', 'whenCreated',
+        'msPKI-Cert-Template-OID', 'displayName'
+    )
+
+    $newTemplate = $null
+
+    try {
+        Write-InfoMessage "Duplicating certificate template '$BaseName' as '$DisplayName'."
+        $newTemplate = $container.Children.Add("CN=$InternalName", 'pKICertificateTemplate')
+
+        foreach ($propertyName in $baseTemplate.Properties.PropertyNames) {
+            if ($propertyName -in $excludedProperties) {
+                continue
+            }
+
+            $values = @($baseTemplate.Properties[$propertyName])
+            if ($values.Count -eq 0) {
+                continue
+            }
+
+            try {
+                $newTemplate.Properties[$propertyName].Clear()
+                foreach ($value in $values) {
+                    [void]$newTemplate.Properties[$propertyName].Add($value)
+                }
+            }
+            catch {
+                Write-WarningMessage "Skipped non-copyable template property '$propertyName': $($_.Exception.Message)"
+            }
+        }
+
+        $baseOid = [string]$baseTemplate.Properties['msPKI-Cert-Template-OID'].Value
+        if ([string]::IsNullOrWhiteSpace($baseOid)) {
+            throw "Base template '$BaseName' does not contain msPKI-Cert-Template-OID."
+        }
+
+        $newTemplate.Properties['displayName'].Value = $DisplayName
+        $newTemplate.Properties['msPKI-Cert-Template-OID'].Value = New-UniqueCertificateTemplateOid -BaseOid $baseOid
+
+        # Increment the minor revision to distinguish the duplicate.
+        $minorRevision = 0
+        if ($null -ne $baseTemplate.Properties['revision'].Value) {
+            $minorRevision = [int]$baseTemplate.Properties['revision'].Value
+        }
+        $newTemplate.Properties['revision'].Value = ($minorRevision + 1)
+
+        $newTemplate.CommitChanges()
+        $newTemplate.RefreshCache()
+        Write-Success "Created certificate template '$DisplayName' (internal name '$InternalName')."
+        return $newTemplate
+    }
+    catch {
+        if ($null -ne $newTemplate) {
+            try { $newTemplate.Dispose() } catch { }
+        }
+        throw "Failed to duplicate certificate template '$BaseName': $($_.Exception.Message)"
+    }
+    finally {
+        $baseTemplate.Dispose()
+        $container.Dispose()
+    }
+}
+
+function Get-OrCreateTemplateDirectoryEntry {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][string]$InternalName,
+        [Parameter(Mandatory = $true)][string]$BaseName,
+        [Parameter(Mandatory = $true)][bool]$CreateIfMissing
+    )
+
+    $template = Find-TemplateDirectoryEntry -Name $Name
+    if ($null -ne $template) {
+        return $template
+    }
+
+    if (-not $CreateIfMissing) {
+        throw @"
+Certificate template '$Name' was not found in Active Directory.
+
+Create it by opening certtmpl.msc, duplicating the Web Server template, and
+setting the display name to '$Name' and template name to '$InternalName'.
+Then rerun the script, or rerun with -CreateTemplateIfMissing `$true.
+"@
+    }
+
+    return New-CertificateTemplateFromBase `
+        -BaseName $BaseName `
+        -InternalName $InternalName `
+        -DisplayName $Name
 }
 
 function Get-LocalEnterpriseCa {
@@ -491,8 +652,12 @@ try {
         -Group $enrollmentGroup `
         -RemoveStale $RemoveStaleMembers
 
-    Write-Step "Locating certificate template '$TemplateName'"
-    $template = Get-TemplateDirectoryEntry -Name $TemplateName
+    Write-Step "Locating or creating certificate template '$TemplateName'"
+    $template = Get-OrCreateTemplateDirectoryEntry `
+        -Name $TemplateName `
+        -InternalName $TemplateInternalName `
+        -BaseName $BaseTemplateName `
+        -CreateIfMissing $CreateTemplateIfMissing
     $internalTemplateName = [string]$template.Properties['cn'].Value
     $templateDisplayName = [string]$template.Properties['displayName'].Value
     Write-Success "Internal template name: $internalTemplateName"
