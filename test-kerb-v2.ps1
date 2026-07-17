@@ -24,7 +24,8 @@
       - TCP port 5986 listener
       - Windows Firewall rules covering TCP 5986
 
-    This script does not modify the system.
+    This script does not modify the system. It uses WSMan PowerShell cmdlets
+    instead of relying on winrm.exe.
 
 .NOTES
     Designed for Windows PowerShell 5.1.
@@ -32,9 +33,11 @@
 
 [CmdletBinding()]
 param(
-    [string]$ExpectedGpoName = 'Servers - SharePoint',
+    [string]$ExpectedGpoName = 'SharePoint Servers - Certificate Auto-Enrollment',
 
     [string]$ExpectedTemplateName = 'Ansible WinRM HTTPS',
+
+    [string]$ExpectedTemplateInternalName = 'AnsibleWinRMHTTPS',
 
     [ValidateRange(1, 500)]
     [int]$EventCount = 30
@@ -45,6 +48,7 @@ $ErrorActionPreference = 'Continue'
 
 $script:Failures = 0
 $script:Warnings = 0
+$script:DiscoveredEnterpriseCas = @()
 
 function Write-Section {
     param(
@@ -389,91 +393,313 @@ function Test-AutoEnrollmentPolicy {
     }
 }
 
+function Get-EnterpriseCaObjects {
+    $rootDse = [ADSI]'LDAP://RootDSE'
+    $configurationNc = [string]$rootDse.configurationNamingContext
+
+    if ([string]::IsNullOrWhiteSpace($configurationNc)) {
+        throw 'The Active Directory configuration naming context could not be read.'
+    }
+
+    $enrollmentServicesDn = @(
+        'CN=Enrollment Services'
+        'CN=Public Key Services'
+        'CN=Services'
+        $configurationNc
+    ) -join ','
+
+    $searchRoot = New-Object System.DirectoryServices.DirectoryEntry `
+        -ArgumentList "LDAP://$enrollmentServicesDn"
+
+    $searcher = New-Object System.DirectoryServices.DirectorySearcher `
+        -ArgumentList $searchRoot
+
+    $searcher.Filter = '(objectClass=pKIEnrollmentService)'
+    $searcher.SearchScope =
+        [System.DirectoryServices.SearchScope]::OneLevel
+
+    foreach ($propertyName in @(
+        'cn',
+        'displayName',
+        'dNSHostName',
+        'certificateTemplates',
+        'flags'
+    )) {
+        [void]$searcher.PropertiesToLoad.Add($propertyName)
+    }
+
+    $results = @($searcher.FindAll())
+    $cas = @()
+
+    foreach ($result in $results) {
+        $properties = $result.Properties
+
+        $caName = ''
+        if ($properties['cn'].Count -gt 0) {
+            $caName = [string]$properties['cn'][0]
+        }
+
+        $dnsHostName = ''
+        if ($properties['dnshostname'].Count -gt 0) {
+            $dnsHostName = [string]$properties['dnshostname'][0]
+        }
+
+        $displayName = $caName
+        if ($properties['displayname'].Count -gt 0) {
+            $displayName = [string]$properties['displayname'][0]
+        }
+
+        $templates = @()
+        if ($properties['certificatetemplates'].Count -gt 0) {
+            $templates = @(
+                $properties['certificatetemplates'] |
+                ForEach-Object { [string]$_ }
+            )
+        }
+
+        $flags = $null
+        if ($properties['flags'].Count -gt 0) {
+            $flags = [int]$properties['flags'][0]
+        }
+
+        $configuration = ''
+        if (
+            -not [string]::IsNullOrWhiteSpace($dnsHostName) -and
+            -not [string]::IsNullOrWhiteSpace($caName)
+        ) {
+            $configuration = "$dnsHostName\$caName"
+        }
+
+        $cas += [pscustomobject]@{
+            Name                 = $caName
+            DisplayName          = $displayName
+            DnsHostName          = $dnsHostName
+            Configuration        = $configuration
+            CertificateTemplates = $templates
+            Flags                = $flags
+            DistinguishedName    = [string]$result.Path
+        }
+    }
+
+    return $cas
+}
+
 function Test-EnterpriseCaDiscovery {
     Write-Section 'Enterprise Certification Authority discovery'
 
     try {
-        $output = @(& certutil.exe -config - -ping 2>&1)
-        $exitCode = $LASTEXITCODE
-
-        foreach ($line in $output) {
-            Write-Host "  $line"
-        }
-
-        if ($exitCode -eq 0) {
-            Write-Pass 'An enterprise CA was discovered and contacted.'
-        }
-        else {
-            Write-Fail "Enterprise CA discovery failed with exit code $exitCode."
-        }
+        $cas = @(Get-EnterpriseCaObjects)
+        $script:DiscoveredEnterpriseCas = $cas
     }
     catch {
-        Write-Fail "Could not run certutil CA discovery: $($_.Exception.Message)"
+        Write-Fail "Could not query Enterprise CA objects from Active Directory: $($_.Exception.Message)"
+        return
     }
+
+    if ($cas.Count -eq 0) {
+        Write-Fail @'
+No pKIEnrollmentService objects were found in the Active Directory
+Configuration partition. Enterprise enrollment discovery cannot work until
+the Enterprise CA is published in AD.
+'@
+        return
+    }
+
+    Write-Pass "Active Directory published $($cas.Count) Enterprise CA object(s)."
+
+    foreach ($ca in $cas) {
+        Write-Host ''
+        Write-Info "CA name: $($ca.Name)"
+        Write-Info "CA host: $($ca.DnsHostName)"
+        Write-Info "CA configuration: $($ca.Configuration)"
+        Write-Info "Published templates: $($ca.CertificateTemplates.Count)"
+
+        if ([string]::IsNullOrWhiteSpace($ca.DnsHostName)) {
+            Write-Fail "CA '$($ca.Name)' has no dNSHostName in its AD enrollment-service object."
+            continue
+        }
+
+        try {
+            $addresses = @(
+                [System.Net.Dns]::GetHostAddresses($ca.DnsHostName)
+            )
+
+            if ($addresses.Count -gt 0) {
+                Write-Pass "DNS resolved '$($ca.DnsHostName)' to $($addresses -join ', ')."
+            }
+            else {
+                Write-Fail "DNS returned no addresses for '$($ca.DnsHostName)'."
+            }
+        }
+        catch {
+            Write-Fail "DNS resolution failed for '$($ca.DnsHostName)': $($_.Exception.Message)"
+            continue
+        }
+
+        if ([string]::IsNullOrWhiteSpace($ca.Configuration)) {
+            Write-Fail "The CA configuration string could not be constructed for '$($ca.Name)'."
+            continue
+        }
+
+        try {
+            $output = @(
+                & certutil.exe `
+                    -config $ca.Configuration `
+                    -ping 2>&1
+            )
+            $exitCode = $LASTEXITCODE
+
+            foreach ($line in $output) {
+                Write-Host "  $line"
+            }
+
+            if ($exitCode -eq 0) {
+                Write-Pass "Successfully contacted '$($ca.Configuration)'."
+            }
+            else {
+                Write-Fail @"
+The CA '$($ca.Configuration)' is published in AD but could not be contacted.
+certutil exit code: $exitCode
+
+Check DNS, RPC endpoint mapper TCP 135, dynamic RPC ports, the CertSvc service,
+and firewall rules between this SharePoint server and the CA.
+"@
+            }
+        }
+        catch {
+            Write-Fail "Could not ping CA '$($ca.Configuration)': $($_.Exception.Message)"
+        }
+    }
+}
+
+function ConvertTo-LdapFilterValue {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Value
+    )
+
+    $builder = New-Object System.Text.StringBuilder
+
+    foreach ($character in $Value.ToCharArray()) {
+        switch ([int][char]$character) {
+            0  { [void]$builder.Append('\00'); continue }
+            40 { [void]$builder.Append('\28'); continue }
+            41 { [void]$builder.Append('\29'); continue }
+            42 { [void]$builder.Append('\2a'); continue }
+            92 { [void]$builder.Append('\5c'); continue }
+            default { [void]$builder.Append($character) }
+        }
+    }
+
+    return $builder.ToString()
 }
 
 function Test-CertificateTemplates {
     param(
-        [string]$TemplateName
+        [Parameter(Mandatory = $true)]
+        [string]$TemplateName,
+
+        [Parameter(Mandatory = $true)]
+        [string]$TemplateInternalName
     )
 
-    Write-Section 'Available certificate templates'
+    Write-Section 'Certificate template publication and visibility'
+
+    $templateFoundOnCa = $false
+
+    foreach ($ca in @($script:DiscoveredEnterpriseCas)) {
+        $publishedNames = @($ca.CertificateTemplates)
+
+        $isPublished =
+            $publishedNames -contains $TemplateInternalName -or
+            $publishedNames -contains $TemplateName
+
+        if ($isPublished) {
+            $templateFoundOnCa = $true
+            Write-Pass "Template '$TemplateInternalName' is published by '$($ca.Configuration)'."
+        }
+        else {
+            Write-Fail "Template '$TemplateInternalName' is not published by '$($ca.Configuration)'."
+        }
+    }
+
+    if ($script:DiscoveredEnterpriseCas.Count -eq 0) {
+        Write-Warn 'Template publication could not be checked because no Enterprise CA objects were discovered.'
+    }
+
+    try {
+        $rootDse = [ADSI]'LDAP://RootDSE'
+        $configurationNc = [string]$rootDse.configurationNamingContext
+        $templateContainerDn = @(
+            'CN=Certificate Templates'
+            'CN=Public Key Services'
+            'CN=Services'
+            $configurationNc
+        ) -join ','
+
+        $searchRoot = New-Object System.DirectoryServices.DirectoryEntry `
+            -ArgumentList "LDAP://$templateContainerDn"
+
+        $searcher = New-Object System.DirectoryServices.DirectorySearcher `
+            -ArgumentList $searchRoot
+
+        $escapedInternalName =
+            ConvertTo-LdapFilterValue -Value $TemplateInternalName
+
+        $escapedDisplayName =
+            ConvertTo-LdapFilterValue -Value $TemplateName
+
+        $searcher.Filter = "(&(objectClass=pKICertificateTemplate)(|(cn=$escapedInternalName)(displayName=$escapedDisplayName)))"
+        $searcher.SearchScope =
+            [System.DirectoryServices.SearchScope]::OneLevel
+
+        $result = $searcher.FindOne()
+
+        if ($null -ne $result) {
+            Write-Pass "Template '$TemplateName' exists in Active Directory."
+            Write-Info "Template AD path: $($result.Path)"
+        }
+        else {
+            Write-Fail "Template '$TemplateName' does not exist in Active Directory."
+        }
+    }
+    catch {
+        Write-Fail "Could not query the certificate template in Active Directory: $($_.Exception.Message)"
+    }
 
     try {
         $output = @(& certutil.exe -template 2>&1)
         $exitCode = $LASTEXITCODE
         $text = $output -join [Environment]::NewLine
 
-        if ($exitCode -ne 0) {
-            Write-Fail "certutil -template failed with exit code $exitCode."
-
-            foreach ($line in $output) {
-                Write-Host "  $line"
+        if ($exitCode -eq 0) {
+            if (
+                $text -match [regex]::Escape($TemplateName) -or
+                $text -match [regex]::Escape($TemplateInternalName)
+            ) {
+                Write-Pass "The local enrollment client can enumerate '$TemplateName'."
             }
-
-            return
-        }
-
-        if ([string]::IsNullOrWhiteSpace($TemplateName)) {
-            Write-Pass 'Certificate template enumeration succeeded.'
-        }
-        elseif ($text -match [regex]::Escape($TemplateName)) {
-            Write-Pass "Template '$TemplateName' is visible to this computer."
+            elseif ($templateFoundOnCa) {
+                Write-Warn @"
+The template is published on an Enterprise CA but did not appear in
+'certutil -template' output. This commonly indicates enrollment-policy cache,
+AD replication, or Read/Enroll permission issues for this computer.
+"@
+            }
+            else {
+                Write-Fail "The local enrollment client cannot see '$TemplateName'."
+            }
         }
         else {
-            Write-Fail @"
-Template '$TemplateName' was not found in the templates visible to this computer.
+            Write-Warn "certutil -template returned exit code $exitCode."
 
-Possible causes:
-  - The template is not published on the issuing CA.
-  - The computer does not have Read permission.
-  - The computer does not have Enroll permission.
-  - The supplied name differs from the template display name or template name.
-"@
-        }
-
-        $matchingLines = @()
-
-        foreach ($line in $output) {
-            if (
-                $line -match '(?i)template' -or
-                (
-                    -not [string]::IsNullOrWhiteSpace($TemplateName) -and
-                    $line -match [regex]::Escape($TemplateName)
-                )
-            ) {
-                $matchingLines += $line
-            }
-        }
-
-        if ($matchingLines.Count -gt 0) {
-            foreach ($line in $matchingLines) {
+            foreach ($line in $output) {
                 Write-Host "  $line"
             }
         }
     }
     catch {
-        Write-Fail "Could not enumerate certificate templates: $($_.Exception.Message)"
+        Write-Warn "Could not run certutil template enumeration: $($_.Exception.Message)"
     }
 }
 
@@ -707,29 +933,75 @@ function Test-WinRmConfiguration {
     }
 
     try {
-        $output = @(
-            & winrm.exe enumerate winrm/config/listener 2>&1
+        Import-Module Microsoft.WSMan.Management -ErrorAction SilentlyContinue
+
+        $listeners = @(
+            Get-WSManInstance `
+                -ResourceURI 'winrm/config/listener' `
+                -Enumerate `
+                -ErrorAction Stop
         )
 
-        $exitCode = $LASTEXITCODE
-        $text = $output -join [Environment]::NewLine
-
-        foreach ($line in $output) {
-            Write-Host "  $line"
-        }
-
-        if ($exitCode -ne 0) {
-            Write-Fail "WinRM listener enumeration failed with exit code $exitCode."
-        }
-        elseif ($text -match '(?im)^\s*Transport\s*=\s*HTTPS\s*$') {
-            Write-Pass 'A WinRM HTTPS listener exists.'
+        if ($listeners.Count -eq 0) {
+            Write-Fail 'No WinRM listeners are configured.'
         }
         else {
-            Write-Fail 'No WinRM HTTPS listener exists.'
+            $listenerOutput = foreach ($listener in $listeners) {
+                [pscustomobject]@{
+                    Address               = [string]$listener.Address
+                    Transport             = [string]$listener.Transport
+                    Port                  = [string]$listener.Port
+                    Hostname              = [string]$listener.Hostname
+                    CertificateThumbprint = [string]$listener.CertificateThumbprint
+                    Enabled               = [string]$listener.Enabled
+                }
+            }
+
+            $listenerOutput | Format-Table -Wrap -AutoSize
+
+            $httpsListeners = @(
+                $listenerOutput |
+                Where-Object {
+                    $_.Transport -eq 'HTTPS'
+                }
+            )
+
+            if ($httpsListeners.Count -gt 0) {
+                Write-Pass "Found $($httpsListeners.Count) WinRM HTTPS listener(s)."
+
+                foreach ($httpsListener in $httpsListeners) {
+                    if (
+                        [string]::IsNullOrWhiteSpace(
+                            $httpsListener.CertificateThumbprint
+                        )
+                    ) {
+                        Write-Fail 'A WinRM HTTPS listener has no certificate thumbprint.'
+                        continue
+                    }
+
+                    $certificatePath =
+                        'Cert:\LocalMachine\My\{0}' -f
+                        $httpsListener.CertificateThumbprint
+
+                    $listenerCertificate = Get-Item `
+                        -LiteralPath $certificatePath `
+                        -ErrorAction SilentlyContinue
+
+                    if ($null -ne $listenerCertificate) {
+                        Write-Pass "Listener certificate '$($httpsListener.CertificateThumbprint)' exists in LocalMachine\My."
+                    }
+                    else {
+                        Write-Fail "Listener certificate '$($httpsListener.CertificateThumbprint)' is missing from LocalMachine\My."
+                    }
+                }
+            }
+            else {
+                Write-Fail 'No WinRM HTTPS listener exists.'
+            }
         }
     }
     catch {
-        Write-Fail "Could not enumerate WinRM listeners: $($_.Exception.Message)"
+        Write-Fail "Could not enumerate WinRM listeners through WSMan: $($_.Exception.Message)"
     }
 
     try {
@@ -744,11 +1016,7 @@ function Test-WinRmConfiguration {
             Write-Pass 'A process is listening on TCP 5986.'
 
             $tcpListeners |
-                Select-Object `
-                    LocalAddress,
-                    LocalPort,
-                    State,
-                    OwningProcess |
+                Select-Object LocalAddress, LocalPort, State, OwningProcess |
                 Format-Table -AutoSize
         }
         else {
@@ -882,7 +1150,8 @@ Test-AutoEnrollmentPolicy
 Test-EnterpriseCaDiscovery
 
 Test-CertificateTemplates `
-    -TemplateName $ExpectedTemplateName
+    -TemplateName $ExpectedTemplateName `
+    -TemplateInternalName $ExpectedTemplateInternalName
 
 Show-EnrollmentEvents `
     -MaximumEvents $EventCount
