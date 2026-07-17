@@ -93,6 +93,30 @@ function Get-ComputerFqdn {
     ).TrimEnd('.').ToLowerInvariant()
 }
 
+function Test-TemplateVisibleToClient {
+    param(
+        [Parameter(Mandatory)]
+        [string]$TemplateInternalName,
+
+        [Parameter(Mandatory)]
+        [string]$TemplateDisplayName
+    )
+
+    $output = @(& certutil.exe -template 2>&1)
+    $exitCode = $LASTEXITCODE
+    $text = $output -join [Environment]::NewLine
+
+    if ($exitCode -ne 0) {
+        Write-Warning "certutil -template failed with exit code $exitCode."
+        return $false
+    }
+
+    return (
+        $text -match [regex]::Escape($TemplateInternalName) -or
+        $text -match [regex]::Escape($TemplateDisplayName)
+    )
+}
+
 function Invoke-MachineCertificateEnrollment {
     param(
         [Parameter(Mandatory)]
@@ -120,15 +144,16 @@ function Invoke-MachineCertificateEnrollment {
         return $true
     }
 
-    Write-Warning @"
-certreq enrollment returned exit code $exitCode.
+    $unsignedExitCode = [uint32]$exitCode
+    $hexExitCode = '0x{0:X8}' -f $unsignedExitCode
 
-This usually means one of the following:
-  - The template is not published on an Enterprise CA.
-  - The computer lacks Read, Enroll, or Autoenroll permission.
-  - The template internal name is incorrect.
-  - No Enterprise CA is reachable through certificate enrollment policy.
-"@
+    Write-Warning "certreq enrollment failed: $exitCode ($hexExitCode)."
+
+    try {
+        & certutil.exe -error $hexExitCode
+    }
+    catch {
+    }
 
     return $false
 }
@@ -156,14 +181,46 @@ function Test-SuitableCertificate {
     }
 
     $serverAuthOid = '1.3.6.1.5.5.7.3.1'
-    if (
-        @(
-            $Certificate.EnhancedKeyUsageList |
-            Where-Object {
-                $_.ObjectId.Value -eq $serverAuthOid
+    $hasServerAuthentication = $false
+
+    try {
+        foreach ($usage in @($Certificate.EnhancedKeyUsageList)) {
+            $oidValue = $null
+
+            $objectIdProperty =
+                $usage.PSObject.Properties['ObjectId']
+
+            if ($null -ne $objectIdProperty) {
+                $objectId = $objectIdProperty.Value
+
+                if (
+                    $null -ne $objectId -and
+                    $null -ne $objectId.PSObject.Properties['Value']
+                ) {
+                    $oidValue =
+                        [string]$objectId.PSObject.Properties['Value'].Value
+                }
             }
-        ).Count -eq 0
-    ) {
+
+            if (
+                [string]::IsNullOrWhiteSpace($oidValue) -and
+                $null -ne $usage.PSObject.Properties['Value']
+            ) {
+                $oidValue =
+                    [string]$usage.PSObject.Properties['Value'].Value
+            }
+
+            if ($oidValue -eq $serverAuthOid) {
+                $hasServerAuthentication = $true
+                break
+            }
+        }
+    }
+    catch {
+        $hasServerAuthentication = $false
+    }
+
+    if (-not $hasServerAuthentication) {
         return $false
     }
 
@@ -241,6 +298,26 @@ if ($null -eq $certutilCommand) {
 }
 
 Write-Host '[OK] Native certificate enrollment tools are available.' `
+    -ForegroundColor Green
+
+Write-Step 'Checking template visibility'
+$templateVisible = Test-TemplateVisibleToClient `
+    -TemplateInternalName $TemplateInternalName `
+    -TemplateDisplayName $TemplateDisplayName
+
+if (-not $templateVisible) {
+    throw @"
+The certificate enrollment client cannot see template '$TemplateInternalName'.
+
+Do not continue with node enrollment yet. Run the CA-side repair script:
+  Repair-SharePoint-WinRM-CertificateTemplate-v8.ps1
+
+Then restart Certificate Services, allow AD replication, restart this server,
+and rerun this node script.
+"@
+}
+
+Write-Host '[OK] Certificate template is visible to this node.' `
     -ForegroundColor Green
 
 Write-Step 'Refreshing Group Policy and certificate enrollment'
