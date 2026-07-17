@@ -20,6 +20,13 @@ param(
     #   10.20.30.0/24
     [string]$WinRmIPv4Filter = '*',
 
+    # Keep HTTP/5985 enabled during migration. Set to $false after HTTPS is verified.
+    [bool]$EnableWinRmHttp = $true,
+
+    # Configure machine certificate auto-enrollment policy. The CA template must
+    # already be published and grant the target computers Enroll/Autoenroll.
+    [bool]$EnableCertificateAutoEnrollment = $true,
+
     [securestring]$AccountPassword
 )
 
@@ -284,16 +291,39 @@ function Set-WinRmGpoSettings {
         -Value 2
 }
 
-function Set-WinRmFirewallGpoRule {
+function Set-CertificateAutoEnrollmentGpoSettings {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Name
+    )
+
+    Write-Host "Configuring computer certificate auto-enrollment policy..."
+
+    # AEPolicy bitmask:
+    # 1 = enroll certificates automatically
+    # 2 = renew expired certificates/update pending certificates/remove revoked
+    # 4 = update certificates that use certificate templates
+    Set-GPRegistryValue `
+        -Name $Name `
+        -Key 'HKLM\SOFTWARE\Policies\Microsoft\Cryptography\AutoEnrollment' `
+        -ValueName 'AEPolicy' `
+        -Type DWord `
+        -Value 7
+}
+
+function Set-WinRmFirewallGpoRules {
     param(
         [Parameter(Mandatory)]
         [string]$Name,
 
         [Parameter(Mandatory)]
-        [string]$RemoteAddresses
+        [string]$RemoteAddresses,
+
+        [Parameter(Mandatory)]
+        [bool]$EnableHttp
     )
 
-    Write-Host "Configuring WinRM firewall rule..."
+    Write-Host "Configuring WinRM firewall rules..."
 
     $addresses = if ($RemoteAddresses -eq '*') {
         '*'
@@ -302,27 +332,314 @@ function Set-WinRmFirewallGpoRule {
         $RemoteAddresses
     }
 
-    $firewallRule = @(
+    $firewallPolicyKey =
+        'HKLM\SOFTWARE\Policies\Microsoft\WindowsFirewall\FirewallRules'
+
+    $httpsRule = @(
         'v2.30'
         'Action=Allow'
         'Active=TRUE'
         'Dir=In'
         'Protocol=6'
-        'LPort=5985'
+        'LPort=5986'
         "RA4=$addresses"
         'Profile=Domain'
-        'Name=Ansible WinRM HTTP'
-        'Desc=Allow WinRM HTTP from approved Ansible management addresses'
+        'Name=Ansible WinRM HTTPS'
+        'Desc=Allow WinRM HTTPS from approved Ansible management addresses'
     ) -join '|'
 
-    $firewallRule += '|'
+    $httpsRule += '|'
 
     Set-GPRegistryValue `
         -Name $Name `
-        -Key 'HKLM\SOFTWARE\Policies\Microsoft\WindowsFirewall\FirewallRules' `
-        -ValueName 'Ansible-WinRM-HTTP-5985' `
+        -Key $firewallPolicyKey `
+        -ValueName 'Ansible-WinRM-HTTPS-5986' `
         -Type String `
-        -Value $firewallRule
+        -Value $httpsRule
+
+    if ($EnableHttp) {
+        $httpRule = @(
+            'v2.30'
+            'Action=Allow'
+            'Active=TRUE'
+            'Dir=In'
+            'Protocol=6'
+            'LPort=5985'
+            "RA4=$addresses"
+            'Profile=Domain'
+            'Name=Ansible WinRM HTTP'
+            'Desc=Allow WinRM HTTP from approved Ansible management addresses during HTTPS migration'
+        ) -join '|'
+
+        $httpRule += '|'
+
+        Set-GPRegistryValue `
+            -Name $Name `
+            -Key $firewallPolicyKey `
+            -ValueName 'Ansible-WinRM-HTTP-5985' `
+            -Type String `
+            -Value $httpRule
+    }
+    else {
+        Remove-GPRegistryValue `
+            -Name $Name `
+            -Key $firewallPolicyKey `
+            -ValueName 'Ansible-WinRM-HTTP-5985' `
+            -ErrorAction SilentlyContinue
+    }
+}
+
+function Set-GpoWinRmHttpsStartupScript {
+    param(
+        [Parameter(Mandatory)]
+        $Gpo
+    )
+
+    Write-Host "Deploying idempotent WinRM HTTPS startup script..."
+
+    $gpoGuidText =
+        "{$($Gpo.Id.ToString().ToUpperInvariant())}"
+
+    $gpoAdPath =
+        "CN=$gpoGuidText,CN=Policies,CN=System,$($domain.DistinguishedName)"
+
+    $gpoSysvolPath = Join-Path `
+        "\\$($domain.PDCEmulator)\SYSVOL\$($domain.DNSRoot)\Policies" `
+        $gpoGuidText
+
+    $scriptsDirectory = Join-Path `
+        $gpoSysvolPath `
+        'Machine\Scripts'
+
+    $startupDirectory = Join-Path `
+        $scriptsDirectory `
+        'Startup'
+
+    $startupScriptName =
+        'Configure-WinRmHttps.ps1'
+
+    $startupScriptPath = Join-Path `
+        $startupDirectory `
+        $startupScriptName
+
+    New-Item `
+        -Path $startupDirectory `
+        -ItemType Directory `
+        -Force |
+        Out-Null
+
+    $startupScript = @'
+# Runs as Local System through computer startup policy.
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+$logDirectory = Join-Path $env:ProgramData 'Ansible-WinRM'
+$logPath = Join-Path $logDirectory 'Configure-WinRmHttps.log'
+New-Item -Path $logDirectory -ItemType Directory -Force | Out-Null
+
+function Write-SetupLog {
+    param([Parameter(Mandatory)][string]$Message)
+
+    $line = '{0:u} {1}' -f (Get-Date), $Message
+    Add-Content -LiteralPath $logPath -Value $line -Encoding UTF8
+}
+
+try {
+    Set-Service -Name WinRM -StartupType Automatic
+    Start-Service -Name WinRM
+
+    $computerSystem = Get-CimInstance -ClassName Win32_ComputerSystem
+    $fqdn = [string]$computerSystem.DNSHostName
+
+    if ($computerSystem.PartOfDomain -and $computerSystem.Domain) {
+        $fqdn = '{0}.{1}' -f $computerSystem.DNSHostName, $computerSystem.Domain
+    }
+
+    $fqdn = $fqdn.TrimEnd('.').ToLowerInvariant()
+
+    if (-not $fqdn) {
+        throw 'Unable to determine the computer FQDN.'
+    }
+
+    Write-SetupLog "Searching for a Server Authentication certificate for $fqdn."
+
+    $serverAuthenticationOid = '1.3.6.1.5.5.7.3.1'
+    $now = Get-Date
+
+    $certificate = Get-ChildItem -Path Cert:\LocalMachine\My |
+        Where-Object {
+            if (-not $_.HasPrivateKey -or $_.NotAfter -le $now) {
+                return $false
+            }
+
+            $hasServerAuthentication = @(
+                $_.EnhancedKeyUsageList |
+                Where-Object { $_.ObjectId.Value -eq $serverAuthenticationOid }
+            ).Count -gt 0
+
+            if (-not $hasServerAuthentication) {
+                return $false
+            }
+
+            $dnsNames = @(
+                $_.DnsNameList |
+                ForEach-Object { $_.Unicode.TrimEnd('.').ToLowerInvariant() }
+            )
+
+            $subjectCn = $null
+            if ($_.Subject -match '(?:^|,\s*)CN=([^,]+)') {
+                $subjectCn = $Matches[1].TrimEnd('.').ToLowerInvariant()
+            }
+
+            ($dnsNames -contains $fqdn) -or ($subjectCn -eq $fqdn)
+        } |
+        Sort-Object -Property NotAfter -Descending |
+        Select-Object -First 1
+
+    if (-not $certificate) {
+        Write-SetupLog "No suitable certificate is available. Triggering auto-enrollment and leaving HTTPS unconfigured."
+        & certutil.exe -pulse | Out-Null
+        exit 0
+    }
+
+    $thumbprint = $certificate.Thumbprint.Replace(' ', '').ToUpperInvariant()
+    Write-SetupLog "Selected certificate $thumbprint, expiring $($certificate.NotAfter.ToString('u'))."
+
+    $httpsListeners = @(
+        Get-WSManInstance `
+            -ResourceURI 'winrm/config/Listener' `
+            -Enumerate `
+            -ErrorAction SilentlyContinue |
+        Where-Object { $_.Transport -eq 'HTTPS' }
+    )
+
+    $matchingListener = $httpsListeners |
+        Where-Object {
+            $_.CertificateThumbprint.Replace(' ', '').ToUpperInvariant() -eq $thumbprint -and
+            $_.Hostname.TrimEnd('.').ToLowerInvariant() -eq $fqdn
+        } |
+        Select-Object -First 1
+
+    if ($matchingListener) {
+        Write-SetupLog 'The existing HTTPS listener already uses the desired certificate.'
+        exit 0
+    }
+
+    foreach ($listener in $httpsListeners) {
+        Write-SetupLog "Removing stale HTTPS listener using certificate $($listener.CertificateThumbprint)."
+
+        Remove-WSManInstance `
+            -ResourceURI 'winrm/config/Listener' `
+            -SelectorSet @{
+                Address   = [string]$listener.Address
+                Transport = 'HTTPS'
+            }
+    }
+
+    New-WSManInstance `
+        -ResourceURI 'winrm/config/Listener' `
+        -SelectorSet @{
+            Address   = '*'
+            Transport = 'HTTPS'
+        } `
+        -ValueSet @{
+            Hostname              = $fqdn
+            CertificateThumbprint = $thumbprint
+            Enabled               = $true
+        } |
+        Out-Null
+
+    Restart-Service -Name WinRM -Force
+    Write-SetupLog "Created WinRM HTTPS listener for $fqdn on TCP 5986."
+}
+catch {
+    Write-SetupLog "ERROR: $($_.Exception.Message)"
+    throw
+}
+'@
+
+    Set-Content `
+        -LiteralPath $startupScriptPath `
+        -Value $startupScript `
+        -Encoding UTF8
+
+    $powerShellScriptsIniPath = Join-Path `
+        $scriptsDirectory `
+        'psscripts.ini'
+
+    @"
+[Startup]
+0CmdLine=$startupScriptName
+0Parameters=-NoProfile -NonInteractive -ExecutionPolicy Bypass
+"@ | Set-Content `
+        -LiteralPath $powerShellScriptsIniPath `
+        -Encoding Unicode
+
+    # Computer-side Scripts CSE and Scripts snap-in GUID pair.
+    $scriptsCse =
+        '{42B5FAAE-6536-11D2-AE5A-0000F87571E3}'
+
+    $scriptsTool =
+        '{40B6664F-4972-11D1-A7CA-0000F87571E3}'
+
+    $extensionPair =
+        "[$scriptsCse$scriptsTool]"
+
+    $gpoAdObject = Get-ADObject `
+        -Identity $gpoAdPath `
+        -Properties gPCMachineExtensionNames, versionNumber
+
+    $extensionNames =
+        [string]$gpoAdObject.gPCMachineExtensionNames
+
+    if ($extensionNames -notlike "*$scriptsCse*") {
+        $pairs = @(
+            [regex]::Matches(
+                $extensionNames,
+                '\[[^\]]+\]'
+            ) |
+            ForEach-Object {
+                $_.Value
+            }
+        )
+
+        $pairs += $extensionPair
+
+        $extensionNames =
+            ($pairs | Sort-Object -Unique) -join ''
+
+        Set-ADObject `
+            -Identity $gpoAdPath `
+            -Replace @{
+                gPCMachineExtensionNames = $extensionNames
+            }
+    }
+
+    # Increment the computer portion of the GPO version so clients process it.
+    $currentVersion =
+        [int64]$gpoAdObject.versionNumber
+
+    $newVersion =
+        $currentVersion + 65536
+
+    Set-ADObject `
+        -Identity $gpoAdPath `
+        -Replace @{
+            versionNumber = $newVersion
+        }
+
+    $gptIniPath = Join-Path `
+        $gpoSysvolPath `
+        'GPT.INI'
+
+    @"
+[General]
+Version=$newVersion
+"@ | Set-Content `
+        -LiteralPath $gptIniPath `
+        -Encoding ASCII
+
+    Write-Host "Deployed startup script '$startupScriptName'."
 }
 
 function Set-GpoLocalAdministratorsMember {
@@ -638,9 +955,18 @@ Set-WinRmGpoSettings `
     -Name $GpoName `
     -IPv4Filter $WinRmIPv4Filter
 
-Set-WinRmFirewallGpoRule `
+if ($EnableCertificateAutoEnrollment) {
+    Set-CertificateAutoEnrollmentGpoSettings `
+        -Name $GpoName
+}
+
+Set-WinRmFirewallGpoRules `
     -Name $GpoName `
-    -RemoteAddresses $WinRmIPv4Filter
+    -RemoteAddresses $WinRmIPv4Filter `
+    -EnableHttp $EnableWinRmHttp
+
+Set-GpoWinRmHttpsStartupScript `
+    -Gpo $gpo
 
 # -------------------------------------------------------------------------
 # Add the domain group to local Administrators on SharePoint servers
@@ -657,4 +983,7 @@ Write-Host "Security group:  $($domain.NetBIOSName)\$AdminGroupName"
 Write-Host "Objects OU:      $ServiceAccountsOuDn"
 Write-Host "Servers OU:      $TargetOuDn"
 Write-Host "GPO:             $GpoName"
+Write-Host "WinRM HTTPS:     Enabled through startup script and TCP 5986 firewall rule"
+Write-Host "WinRM HTTP:      $EnableWinRmHttp"
+Write-Host "Certificate AE:  $EnableCertificateAutoEnrollment"
 Write-Host ''
