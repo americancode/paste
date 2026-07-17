@@ -1,46 +1,56 @@
-
+#requires -Version 5.1
 #requires -RunAsAdministrator
 
 <#
 .SYNOPSIS
-    Tests whether a Windows server is ready for WinRM over HTTPS.
+    Tests whether a Windows Server target is ready for WinRM over HTTPS.
 
 .DESCRIPTION
-    Checks:
+    Performs read-only diagnostic checks for:
+
       - Domain membership and computer FQDN
-      - Applied Group Policy
+      - Applied computer Group Policy
       - Certificate auto-enrollment policy
       - Enterprise CA discovery
-      - Available certificate templates
+      - Certificate template visibility
       - Certificate enrollment event logs
-      - Certificates in LocalMachine\My
-      - Private key, validity, Server Authentication EKU, and hostname match
-      - Existing WinRM listeners
-      - WinRM service status
-      - TCP 5986 listener
-      - Windows Firewall rules for TCP 5986
+      - Certificates in Cert:\LocalMachine\My
+      - Private key presence
+      - Certificate validity
+      - Server Authentication EKU
+      - SAN or subject CN hostname match
+      - WinRM service
+      - WinRM HTTPS listener
+      - TCP port 5986 listener
+      - Windows Firewall rules covering TCP 5986
 
-    This script makes no configuration changes.
+    This script does not modify the system.
+
+.NOTES
+    Designed for Windows PowerShell 5.1.
 #>
 
 [CmdletBinding()]
 param(
     [string]$ExpectedGpoName = 'Servers - SharePoint',
 
-    # Optional certificate template display name or short template name.
     [string]$ExpectedTemplateName = 'Ansible WinRM HTTPS',
 
+    [ValidateRange(1, 500)]
     [int]$EventCount = 30
 )
 
-Set-StrictMode -Version Latest
+Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Continue'
 
 $script:Failures = 0
 $script:Warnings = 0
 
 function Write-Section {
-    param([Parameter(Mandatory)][string]$Title)
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Title
+    )
 
     Write-Host ''
     Write-Host ('=' * 78) -ForegroundColor Cyan
@@ -49,34 +59,48 @@ function Write-Section {
 }
 
 function Write-Pass {
-    param([Parameter(Mandatory)][string]$Message)
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Message
+    )
 
     Write-Host "[PASS] $Message" -ForegroundColor Green
 }
 
 function Write-Warn {
-    param([Parameter(Mandatory)][string]$Message)
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Message
+    )
 
     $script:Warnings++
     Write-Host "[WARN] $Message" -ForegroundColor Yellow
 }
 
 function Write-Fail {
-    param([Parameter(Mandatory)][string]$Message)
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Message
+    )
 
     $script:Failures++
     Write-Host "[FAIL] $Message" -ForegroundColor Red
 }
 
 function Write-Info {
-    param([Parameter(Mandatory)][string]$Message)
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Message
+    )
 
     Write-Host "[INFO] $Message"
 }
 
 function Get-ComputerFqdn {
     try {
-        $computerSystem = Get-CimInstance Win32_ComputerSystem -ErrorAction Stop
+        $computerSystem = Get-CimInstance `
+            -ClassName Win32_ComputerSystem `
+            -ErrorAction Stop
 
         if (-not $computerSystem.PartOfDomain) {
             Write-Fail 'The computer is not joined to an Active Directory domain.'
@@ -85,9 +109,13 @@ function Get-ComputerFqdn {
 
         Write-Pass "Computer is joined to domain '$($computerSystem.Domain)'."
 
-        return '{0}.{1}' -f `
+        $fqdn = '{0}.{1}' -f `
             $env:COMPUTERNAME.ToLowerInvariant(),
             $computerSystem.Domain.ToLowerInvariant()
+
+        Write-Pass "Detected computer FQDN: $fqdn"
+
+        return $fqdn
     }
     catch {
         Write-Fail "Could not determine domain membership: $($_.Exception.Message)"
@@ -95,27 +123,110 @@ function Get-ComputerFqdn {
     }
 }
 
+function Get-CertificateDnsNames {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Security.Cryptography.X509Certificates.X509Certificate2]
+        $Certificate
+    )
+
+    $names = @()
+
+    try {
+        if ($Certificate.PSObject.Properties.Name -contains 'DnsNameList') {
+            foreach ($dnsName in $Certificate.DnsNameList) {
+                if ($null -ne $dnsName) {
+                    if (
+                        $dnsName.PSObject.Properties.Name -contains 'Unicode' -and
+                        -not [string]::IsNullOrWhiteSpace($dnsName.Unicode)
+                    ) {
+                        $names += [string]$dnsName.Unicode
+                    }
+                    elseif (-not [string]::IsNullOrWhiteSpace([string]$dnsName)) {
+                        $names += [string]$dnsName
+                    }
+                }
+            }
+        }
+    }
+    catch {
+        # Continue to extension parsing below.
+    }
+
+    if ($names.Count -gt 0) {
+        return @($names | Select-Object -Unique)
+    }
+
+    try {
+        $sanExtension = $Certificate.Extensions |
+            Where-Object {
+                $_.Oid.Value -eq '2.5.29.17'
+            } |
+            Select-Object -First 1
+
+        if ($null -ne $sanExtension) {
+            $formattedSan = $sanExtension.Format($true)
+
+            $matches = [regex]::Matches(
+                $formattedSan,
+                '(?im)(?:DNS Name=|DNS:)\s*([^,\r\n]+)'
+            )
+
+            foreach ($match in $matches) {
+                $value = $match.Groups[1].Value.Trim()
+
+                if (-not [string]::IsNullOrWhiteSpace($value)) {
+                    $names += $value
+                }
+            }
+        }
+    }
+    catch {
+        # Return any names already found.
+    }
+
+    return @($names | Select-Object -Unique)
+}
+
 function Test-ServerAuthenticationEku {
     param(
-        [Parameter(Mandatory)]
+        [Parameter(Mandatory = $true)]
         [System.Security.Cryptography.X509Certificates.X509Certificate2]
         $Certificate
     )
 
     $serverAuthenticationOid = '1.3.6.1.5.5.7.3.1'
+    $ekuExtensionOid = '2.5.29.37'
 
-    foreach ($extension in $Certificate.Extensions) {
-        if ($extension.Oid.Value -ne '2.5.29.37') {
-            continue
+    $ekuExtension = $Certificate.Extensions |
+        Where-Object {
+            $_.Oid.Value -eq $ekuExtensionOid
+        } |
+        Select-Object -First 1
+
+    if ($null -eq $ekuExtension) {
+        return $false
+    }
+
+    try {
+        $enhancedKeyUsageExtension =
+            New-Object `
+                System.Security.Cryptography.X509Certificates.X509EnhancedKeyUsageExtension `
+                -ArgumentList $ekuExtension, $ekuExtension.Critical
+
+        foreach ($usage in $enhancedKeyUsageExtension.EnhancedKeyUsages) {
+            if ($usage.Value -eq $serverAuthenticationOid) {
+                return $true
+            }
         }
-
+    }
+    catch {
         try {
-            $ekuExtension =
-                [System.Security.Cryptography.X509Certificates.X509EnhancedKeyUsageExtension]$extension
+            $formattedEku = $ekuExtension.Format($false)
 
             if (
-                $ekuExtension.EnhancedKeyUsages |
-                Where-Object Value -EQ $serverAuthenticationOid
+                $formattedEku -match [regex]::Escape($serverAuthenticationOid) -or
+                $formattedEku -match 'Server Authentication'
             ) {
                 return $true
             }
@@ -128,45 +239,25 @@ function Test-ServerAuthenticationEku {
     return $false
 }
 
-function Get-CertificateDnsNames {
-    param(
-        [Parameter(Mandatory)]
-        [System.Security.Cryptography.X509Certificates.X509Certificate2]
-        $Certificate
-    )
-
-    $names = @()
-
-    try {
-        $names = @(
-            $Certificate.DnsNameList |
-            ForEach-Object {
-                $_.Unicode
-            }
-        )
-    }
-    catch {
-        # DnsNameList may not be available on older PowerShell/.NET versions.
-    }
-
-    return $names
-}
-
 function Test-CertificateHostname {
     param(
-        [Parameter(Mandatory)]
+        [Parameter(Mandatory = $true)]
         [System.Security.Cryptography.X509Certificates.X509Certificate2]
         $Certificate,
 
-        [Parameter(Mandatory)]
+        [Parameter(Mandatory = $true)]
         [string]$Fqdn
     )
 
-    $requiredName = $Fqdn.ToLowerInvariant()
+    $requiredName = $Fqdn.Trim().ToLowerInvariant()
     $dnsNames = @(Get-CertificateDnsNames -Certificate $Certificate)
 
     foreach ($dnsName in $dnsNames) {
-        $candidate = $dnsName.ToLowerInvariant()
+        if ([string]::IsNullOrWhiteSpace($dnsName)) {
+            continue
+        }
+
+        $candidate = $dnsName.Trim().ToLowerInvariant()
 
         if ($candidate -eq $requiredName) {
             return $true
@@ -175,19 +266,39 @@ function Test-CertificateHostname {
         if ($candidate.StartsWith('*.')) {
             $suffix = $candidate.Substring(1)
 
+            $requiredLabelCount = $requiredName.Split('.').Count
+            $candidateLabelCount = $candidate.Split('.').Count
+
             if (
                 $requiredName.EndsWith($suffix) -and
-                $requiredName.Split('.').Count -eq $candidate.Split('.').Count
+                $requiredLabelCount -eq $candidateLabelCount
             ) {
                 return $true
             }
         }
     }
 
-    if ($Certificate.Subject -match '(?i)(?:^|,\s*)CN=([^,]+)') {
-        $commonName = $Matches[1].Trim().ToLowerInvariant()
+    try {
+        $commonName = $Certificate.GetNameInfo(
+            [System.Security.Cryptography.X509Certificates.X509NameType]::DnsName,
+            $false
+        )
 
-        if ($commonName -eq $requiredName) {
+        if (
+            -not [string]::IsNullOrWhiteSpace($commonName) -and
+            $commonName.Trim().ToLowerInvariant() -eq $requiredName
+        ) {
+            return $true
+        }
+    }
+    catch {
+        # Fall back to parsing the subject.
+    }
+
+    if ($Certificate.Subject -match '(?i)(?:^|,\s*)CN=([^,]+)') {
+        $subjectCommonName = $Matches[1].Trim().ToLowerInvariant()
+
+        if ($subjectCommonName -eq $requiredName) {
             return $true
         }
     }
@@ -196,27 +307,37 @@ function Test-CertificateHostname {
 }
 
 function Test-AppliedGpo {
-    param([Parameter(Mandatory)][string]$GpoName)
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$GpoName
+    )
 
     Write-Section 'Applied computer Group Policy'
 
     try {
-        $output = & gpresult.exe /R /SCOPE COMPUTER 2>&1
+        $output = @(& gpresult.exe /R /SCOPE COMPUTER 2>&1)
+        $exitCode = $LASTEXITCODE
         $text = $output -join [Environment]::NewLine
 
-        if ($LASTEXITCODE -ne 0) {
-            Write-Warn "gpresult exited with code $LASTEXITCODE."
+        if ($exitCode -ne 0) {
+            Write-Warn "gpresult exited with code $exitCode."
         }
 
-        if ($text -match [regex]::Escape($GpoName)) {
-            Write-Pass "GPO '$GpoName' is listed in computer policy results."
+        if (
+            -not [string]::IsNullOrWhiteSpace($GpoName) -and
+            $text -match [regex]::Escape($GpoName)
+        ) {
+            Write-Pass "GPO '$GpoName' is listed in the computer policy results."
+        }
+        elseif ([string]::IsNullOrWhiteSpace($GpoName)) {
+            Write-Warn 'No expected GPO name was supplied.'
         }
         else {
-            Write-Fail "GPO '$GpoName' was not found in computer policy results."
+            Write-Fail "GPO '$GpoName' was not found in the computer policy results."
         }
 
-        $output | ForEach-Object {
-            Write-Host "  $_"
+        foreach ($line in $output) {
+            Write-Host "  $line"
         }
     }
     catch {
@@ -230,22 +351,32 @@ function Test-AutoEnrollmentPolicy {
     $path =
         'HKLM:\SOFTWARE\Policies\Microsoft\Cryptography\AutoEnrollment'
 
-    if (-not (Test-Path $path)) {
+    if (-not (Test-Path -LiteralPath $path)) {
         Write-Fail "Auto-enrollment policy registry path does not exist: $path"
         return
     }
 
     try {
-        $settings = Get-ItemProperty -Path $path -ErrorAction Stop
-        $aePolicy = $settings.AEPolicy
+        $settings = Get-ItemProperty `
+            -LiteralPath $path `
+            -ErrorAction Stop
+
+        $aePolicyProperty = $settings.PSObject.Properties['AEPolicy']
+
+        if ($null -eq $aePolicyProperty) {
+            Write-Fail 'The AEPolicy registry value does not exist.'
+            return
+        }
+
+        $aePolicy = [int]$aePolicyProperty.Value
 
         Write-Info "AEPolicy value: $aePolicy"
 
-        if ([int]$aePolicy -gt 0) {
+        if ($aePolicy -gt 0) {
             Write-Pass 'Computer certificate auto-enrollment policy is enabled.'
         }
         else {
-            Write-Fail 'AEPolicy is present but does not enable auto-enrollment.'
+            Write-Fail 'AEPolicy exists but is set to zero.'
         }
 
         $settings |
@@ -262,40 +393,42 @@ function Test-EnterpriseCaDiscovery {
     Write-Section 'Enterprise Certification Authority discovery'
 
     try {
-        $output = & certutil.exe -config - -ping 2>&1
+        $output = @(& certutil.exe -config - -ping 2>&1)
         $exitCode = $LASTEXITCODE
 
-        $output | ForEach-Object {
-            Write-Host "  $_"
+        foreach ($line in $output) {
+            Write-Host "  $line"
         }
 
         if ($exitCode -eq 0) {
-            Write-Pass 'At least one enterprise CA was discovered and contacted.'
+            Write-Pass 'An enterprise CA was discovered and contacted.'
         }
         else {
-            Write-Fail "Enterprise CA discovery or connectivity failed, exit code $exitCode."
+            Write-Fail "Enterprise CA discovery failed with exit code $exitCode."
         }
     }
     catch {
-        Write-Fail "Could not execute certutil CA discovery: $($_.Exception.Message)"
+        Write-Fail "Could not run certutil CA discovery: $($_.Exception.Message)"
     }
 }
 
 function Test-CertificateTemplates {
-    param([string]$TemplateName)
+    param(
+        [string]$TemplateName
+    )
 
     Write-Section 'Available certificate templates'
 
     try {
-        $output = & certutil.exe -template 2>&1
+        $output = @(& certutil.exe -template 2>&1)
         $exitCode = $LASTEXITCODE
         $text = $output -join [Environment]::NewLine
 
         if ($exitCode -ne 0) {
             Write-Fail "certutil -template failed with exit code $exitCode."
 
-            $output | ForEach-Object {
-                Write-Host "  $_"
+            foreach ($line in $output) {
+                Write-Host "  $line"
             }
 
             return
@@ -310,20 +443,32 @@ function Test-CertificateTemplates {
         else {
             Write-Fail @"
 Template '$TemplateName' was not found in the templates visible to this computer.
-Confirm that the template is published and that this computer or its security
-group has Read and Enroll permissions.
+
+Possible causes:
+  - The template is not published on the issuing CA.
+  - The computer does not have Read permission.
+  - The computer does not have Enroll permission.
+  - The supplied name differs from the template display name or template name.
 "@
         }
 
-        $matchingLines = $output |
-            Where-Object {
-                $_ -match 'Template' -or
-                $_ -match [regex]::Escape($TemplateName)
-            }
+        $matchingLines = @()
 
-        if ($matchingLines) {
-            $matchingLines | ForEach-Object {
-                Write-Host "  $_"
+        foreach ($line in $output) {
+            if (
+                $line -match '(?i)template' -or
+                (
+                    -not [string]::IsNullOrWhiteSpace($TemplateName) -and
+                    $line -match [regex]::Escape($TemplateName)
+                )
+            ) {
+                $matchingLines += $line
+            }
+        }
+
+        if ($matchingLines.Count -gt 0) {
+            foreach ($line in $matchingLines) {
+                Write-Host "  $line"
             }
         }
     }
@@ -333,12 +478,15 @@ group has Read and Enroll permissions.
 }
 
 function Show-EnrollmentEvents {
-    param([int]$MaximumEvents)
+    param(
+        [Parameter(Mandatory = $true)]
+        [int]$MaximumEvents
+    )
 
     Write-Section 'Recent certificate enrollment events'
 
     $logs = @(
-        'Microsoft-Windows-CertificateServicesClient-AutoEnrollment/Operational'
+        'Microsoft-Windows-CertificateServicesClient-AutoEnrollment/Operational',
         'Microsoft-Windows-CertificateServicesClient-CertEnroll/Operational'
     )
 
@@ -347,35 +495,51 @@ function Show-EnrollmentEvents {
         Write-Host "Log: $log" -ForegroundColor White
 
         try {
-            $logInfo = Get-WinEvent -ListLog $log -ErrorAction Stop
+            $logInfo = Get-WinEvent `
+                -ListLog $log `
+                -ErrorAction Stop
 
             if (-not $logInfo.IsEnabled) {
                 Write-Warn "Event log '$log' is disabled."
                 continue
             }
 
-            $events = Get-WinEvent `
-                -LogName $log `
-                -MaxEvents $MaximumEvents `
-                -ErrorAction Stop |
-                Sort-Object TimeCreated -Descending
+            $events = @(
+                Get-WinEvent `
+                    -LogName $log `
+                    -MaxEvents $MaximumEvents `
+                    -ErrorAction Stop |
+                Sort-Object -Property TimeCreated -Descending
+            )
 
-            if (-not $events) {
+            if ($events.Count -eq 0) {
                 Write-Warn "No events were found in '$log'."
                 continue
             }
 
-            $events |
-                Select-Object `
-                    TimeCreated,
-                    Id,
-                    LevelDisplayName,
-                    @{
-                        Name = 'Message'
-                        Expression = {
-                            ($_.Message -replace '\s+', ' ').Trim()
-                        }
-                    } |
+            $eventOutput = foreach ($event in $events) {
+                $message = ''
+
+                try {
+                    $message = [string]$event.Message
+                }
+                catch {
+                    $message = '<Unable to read event message>'
+                }
+
+                if ($null -eq $message) {
+                    $message = ''
+                }
+
+                [pscustomobject]@{
+                    TimeCreated      = $event.TimeCreated
+                    Id               = $event.Id
+                    LevelDisplayName = $event.LevelDisplayName
+                    Message          = ($message -replace '\s+', ' ').Trim()
+                }
+            }
+
+            $eventOutput |
                 Format-Table -Wrap -AutoSize
         }
         catch {
@@ -385,14 +549,24 @@ function Show-EnrollmentEvents {
 }
 
 function Test-MachineCertificates {
-    param([Parameter(Mandatory)][string]$Fqdn)
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Fqdn
+    )
 
     Write-Section 'Local Computer personal certificates'
 
     $now = Get-Date
-    $certificates = @(Get-ChildItem Cert:\LocalMachine\My)
 
-    if (-not $certificates) {
+    try {
+        $certificates = @(Get-ChildItem Cert:\LocalMachine\My -ErrorAction Stop)
+    }
+    catch {
+        Write-Fail "Could not read Cert:\LocalMachine\My: $($_.Exception.Message)"
+        return @()
+    }
+
+    if ($certificates.Count -eq 0) {
         Write-Fail 'Cert:\LocalMachine\My contains no certificates.'
         return @()
     }
@@ -400,46 +574,73 @@ function Test-MachineCertificates {
     Write-Info "Required WinRM hostname: $Fqdn"
     Write-Info "Certificates found: $($certificates.Count)"
 
-    $results = foreach ($certificate in $certificates) {
+    $results = @()
+
+    foreach ($certificate in $certificates) {
         $dnsNames = @(Get-CertificateDnsNames -Certificate $certificate)
+
         $hasServerAuthentication =
             Test-ServerAuthenticationEku -Certificate $certificate
+
         $hostnameMatches =
-            Test-CertificateHostname -Certificate $certificate -Fqdn $Fqdn
+            Test-CertificateHostname `
+                -Certificate $certificate `
+                -Fqdn $Fqdn
+
         $currentlyValid =
-            $certificate.NotBefore -le $now -and
-            $certificate.NotAfter -gt $now
+            ($certificate.NotBefore -le $now) -and
+            ($certificate.NotAfter -gt $now)
+
+        $hasPrivateKey = $false
+
+        try {
+            $hasPrivateKey = [bool]$certificate.HasPrivateKey
+        }
+        catch {
+            $hasPrivateKey = $false
+        }
 
         $suitable =
-            $certificate.HasPrivateKey -and
+            $hasPrivateKey -and
             $currentlyValid -and
             $hasServerAuthentication -and
             $hostnameMatches
 
-        [pscustomobject]@{
+        $results += [pscustomobject]@{
             Suitable             = $suitable
             Subject              = $certificate.Subject
             Issuer               = $certificate.Issuer
-            HasPrivateKey        = $certificate.HasPrivateKey
+            HasPrivateKey        = $hasPrivateKey
             CurrentlyValid       = $currentlyValid
             ServerAuthentication = $hasServerAuthentication
             HostnameMatches      = $hostnameMatches
-            DNSNames             = $dnsNames -join ', '
+            DNSNames             = ($dnsNames -join ', ')
             NotBefore            = $certificate.NotBefore
             NotAfter             = $certificate.NotAfter
             Thumbprint           = $certificate.Thumbprint
         }
     }
 
-    $results |
-        Sort-Object `
-            @{Expression='Suitable';Descending=$true},
-            @{Expression='NotAfter';Descending=$true} |
+    $sortedResults = $results |
+        Sort-Object -Property `
+            @{
+                Expression = 'Suitable'
+                Descending = $true
+            },
+            @{
+                Expression = 'NotAfter'
+                Descending = $true
+            }
+
+    $sortedResults |
         Format-List
-        $suitableCertificates = @(
-            $results |
-            Where-Object Suitable
-        )
+
+    $suitableCertificates = @(
+        $results |
+        Where-Object {
+            $_.Suitable -eq $true
+        }
+    )
 
     if ($suitableCertificates.Count -gt 0) {
         Write-Pass "$($suitableCertificates.Count) suitable WinRM HTTPS certificate(s) found."
@@ -448,9 +649,10 @@ function Test-MachineCertificates {
         Write-Fail 'No certificate satisfies every WinRM HTTPS requirement.'
 
         Write-Host ''
-        Write-Host 'Requirement summary:' -ForegroundColor Yellow
+        Write-Host 'Requirement failures by certificate:' -ForegroundColor Yellow
 
         foreach ($result in $results) {
+            Write-Host ''
             Write-Host "Certificate: $($result.Thumbprint)"
 
             if (-not $result.HasPrivateKey) {
@@ -466,7 +668,8 @@ function Test-MachineCertificates {
             }
 
             if (-not $result.HostnameMatches) {
-                Write-Host "  - SAN/CN does not match $Fqdn" -ForegroundColor Red
+                Write-Host "  - SAN or subject CN does not match $Fqdn" `
+                    -ForegroundColor Red
             }
         }
     }
@@ -478,7 +681,9 @@ function Test-WinRmConfiguration {
     Write-Section 'WinRM service and listeners'
 
     try {
-        $service = Get-Service WinRM -ErrorAction Stop
+        $service = Get-Service `
+            -Name WinRM `
+            -ErrorAction Stop
 
         Write-Info "WinRM service status: $($service.Status)"
         Write-Info "WinRM service start type: $($service.StartType)"
@@ -502,14 +707,21 @@ function Test-WinRmConfiguration {
     }
 
     try {
-        $output = & winrm.exe enumerate winrm/config/listener 2>&1
+        $output = @(
+            & winrm.exe enumerate winrm/config/listener 2>&1
+        )
+
+        $exitCode = $LASTEXITCODE
         $text = $output -join [Environment]::NewLine
 
-        $output | ForEach-Object {
-            Write-Host "  $_"
+        foreach ($line in $output) {
+            Write-Host "  $line"
         }
 
-        if ($text -match '(?im)^\s*Transport\s*=\s*HTTPS\s*$') {
+        if ($exitCode -ne 0) {
+            Write-Fail "WinRM listener enumeration failed with exit code $exitCode."
+        }
+        elseif ($text -match '(?im)^\s*Transport\s*=\s*HTTPS\s*$') {
             Write-Pass 'A WinRM HTTPS listener exists.'
         }
         else {
@@ -532,12 +744,12 @@ function Test-WinRmConfiguration {
             Write-Pass 'A process is listening on TCP 5986.'
 
             $tcpListeners |
-                Format-Table `
+                Select-Object `
                     LocalAddress,
                     LocalPort,
                     State,
-                    OwningProcess `
-                    -AutoSize
+                    OwningProcess |
+                Format-Table -AutoSize
         }
         else {
             Write-Fail 'No process is listening on TCP 5986.'
@@ -546,48 +758,98 @@ function Test-WinRmConfiguration {
     catch {
         Write-Fail "Could not inspect TCP 5986: $($_.Exception.Message)"
     }
+
+    try {
+        $localTest = Test-NetConnection `
+            -ComputerName localhost `
+            -Port 5986 `
+            -WarningAction SilentlyContinue
+
+        if ($localTest.TcpTestSucceeded) {
+            Write-Pass 'Local TCP connection to port 5986 succeeded.'
+        }
+        else {
+            Write-Fail 'Local TCP connection to port 5986 failed.'
+        }
+
+        $localTest |
+            Select-Object `
+                ComputerName,
+                RemoteAddress,
+                RemotePort,
+                InterfaceAlias,
+                SourceAddress,
+                TcpTestSucceeded |
+            Format-List
+    }
+    catch {
+        Write-Fail "Could not run the local TCP 5986 test: $($_.Exception.Message)"
+    }
 }
 
 function Test-WinRmFirewall {
     Write-Section 'Windows Firewall rules for TCP 5986'
 
     try {
-        $matchingRules = foreach (
-            $rule in Get-NetFirewallRule `
+        $inboundAllowRules = @(
+            Get-NetFirewallRule `
                 -Enabled True `
                 -Direction Inbound `
                 -Action Allow `
                 -ErrorAction Stop
-        ) {
+        )
+
+        $matchingRules = @()
+
+        foreach ($rule in $inboundAllowRules) {
             $portFilters = @(
                 $rule |
                 Get-NetFirewallPortFilter `
-                    -ErrorAction SilentlyContinue |
-                Where-Object {
-                    $_.Protocol -eq 'TCP' -and
-                    (
-                        $_.LocalPort -eq '5986' -or
-                        $_.LocalPort -eq 'Any'
-                    )
-                }
+                    -ErrorAction SilentlyContinue
             )
 
-            if ($portFilters) {
-                $addressFilter = $rule |
+            foreach ($portFilter in $portFilters) {
+                $protocol = [string]$portFilter.Protocol
+                $localPort = [string]$portFilter.LocalPort
+
+                $protocolMatches =
+                    $protocol -eq 'TCP' -or
+                    $protocol -eq '6'
+
+                $portMatches =
+                    $localPort -eq '5986' -or
+                    $localPort -eq 'Any'
+
+                if (-not ($protocolMatches -and $portMatches)) {
+                    continue
+                }
+
+                $addressFilters = @(
+                    $rule |
                     Get-NetFirewallAddressFilter `
                         -ErrorAction SilentlyContinue
+                )
 
-                [pscustomobject]@{
+                $remoteAddresses = @()
+
+                foreach ($addressFilter in $addressFilters) {
+                    if ($null -ne $addressFilter.RemoteAddress) {
+                        $remoteAddresses += @($addressFilter.RemoteAddress)
+                    }
+                }
+
+                $matchingRules += [pscustomobject]@{
                     DisplayName   = $rule.DisplayName
                     Enabled       = $rule.Enabled
                     Profile       = $rule.Profile
-                    LocalPort     = ($portFilters.LocalPort -join ', ')
-                    RemoteAddress = ($addressFilter.RemoteAddress -join ', ')
+                    Protocol      = $protocol
+                    LocalPort     = $localPort
+                    RemoteAddress = ($remoteAddresses -join ', ')
                 }
+
+                break
             }
         }
-
-        $matchingRules = @($matchingRules)
 
         if ($matchingRules.Count -gt 0) {
             Write-Pass 'At least one enabled inbound allow rule covers TCP 5986.'
@@ -612,17 +874,26 @@ Write-Host ''
 
 $fqdn = Get-ComputerFqdn
 
-Test-AppliedGpo -GpoName $ExpectedGpoName
-Test-AutoEnrollmentPolicy
-Test-EnterpriseCaDiscovery
-Test-CertificateTemplates -TemplateName $ExpectedTemplateName
-Show-EnrollmentEvents -MaximumEvents $EventCount
+Test-AppliedGpo `
+    -GpoName $ExpectedGpoName
 
-if ($fqdn) {
-    $null = Test-MachineCertificates -Fqdn $fqdn
+Test-AutoEnrollmentPolicy
+
+Test-EnterpriseCaDiscovery
+
+Test-CertificateTemplates `
+    -TemplateName $ExpectedTemplateName
+
+Show-EnrollmentEvents `
+    -MaximumEvents $EventCount
+
+if (-not [string]::IsNullOrWhiteSpace($fqdn)) {
+    $null = Test-MachineCertificates `
+        -Fqdn $fqdn
 }
 
 Test-WinRmConfiguration
+
 Test-WinRmFirewall
 
 Write-Section 'Final result'
@@ -635,20 +906,23 @@ if ($script:Failures -eq 0) {
     Write-Pass 'The server appears ready for WinRM over HTTPS.'
     exit 0
 }
-else {
-    Write-Host ''
-    Write-Fail @"
-The server is not ready for WinRM over HTTPS.
 
-Review the failed checks above. If the only certificate-related failure is that
-the expected template is unavailable or no suitable certificate exists, correct
-the AD CS template publication and permissions, then run:
+Write-Host ''
+Write-Host 'The server is not ready for WinRM over HTTPS.' `
+    -ForegroundColor Red
 
-    gpupdate /force
-    certutil -pulse
+Write-Host ''
+Write-Host 'Review each [FAIL] result above.' `
+    -ForegroundColor Yellow
 
-After enrollment completes, rerun this test.
-"@
+Write-Host ''
+Write-Host 'After correcting certificate template or enrollment issues, run:' `
+    -ForegroundColor Yellow
 
-    exit 1
-}
+Write-Host ''
+Write-Host '  gpupdate.exe /force'
+Write-Host '  certutil.exe -pulse'
+Write-Host ''
+Write-Host 'Then rerun this script.'
+
+exit 1
