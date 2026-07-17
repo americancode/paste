@@ -1,4 +1,3 @@
-```powershell
 #requires -Version 5.1
 #requires -RunAsAdministrator
 
@@ -851,4 +850,3 @@ catch {
 
     exit 1
 }
-```
