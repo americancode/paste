@@ -8,8 +8,8 @@
 .DESCRIPTION
     This script:
       - Validates domain connectivity without using ADSI RootDSE
-      - Reads the Configuration naming context through LDAP RootDSE safely
-      - Enumerates Enterprise CA publication objects
+      - Avoids LDAP RootDSE and DirectoryServices CA discovery
+      - Uses native machine certificate enrollment through certreq.exe
       - Triggers computer Group Policy and certificate auto-enrollment
       - Finds a suitable machine certificate
       - Creates or repairs the WinRM HTTPS listener through WSMan cmdlets
@@ -78,53 +78,6 @@ $text
     return $match.Groups[1].Value.TrimEnd('.')
 }
 
-function Get-RootDseProperty {
-    param(
-        [Parameter(Mandatory)]
-        [string]$DomainController,
-
-        [Parameter(Mandatory)]
-        [string]$PropertyName
-    )
-
-    $path = "LDAP://$DomainController/RootDSE"
-
-    $entry = New-Object System.DirectoryServices.DirectoryEntry `
-        -ArgumentList @(
-            $path,
-            $null,
-            $null,
-            [System.DirectoryServices.AuthenticationTypes]::Secure
-        )
-
-    try {
-        $entry.RefreshCache(@($PropertyName))
-        $values = $entry.Properties[$PropertyName]
-
-        if ($null -eq $values -or $values.Count -eq 0) {
-            return $null
-        }
-
-        return [string]$values[0]
-    }
-    catch {
-        throw @"
-Could not read '$PropertyName' from '$path'.
-
-$($_.Exception.Message)
-
-Verify:
-  - The server uses domain DNS servers.
-  - TCP/UDP 53 and TCP/UDP 389 are reachable to a domain controller.
-  - The computer secure channel is healthy.
-  - The current computer account can authenticate to the domain.
-"@
-    }
-    finally {
-        $entry.Dispose()
-    }
-}
-
 function Get-ComputerFqdn {
     $computerSystem = Get-CimInstance `
         -ClassName Win32_ComputerSystem `
@@ -140,106 +93,44 @@ function Get-ComputerFqdn {
     ).TrimEnd('.').ToLowerInvariant()
 }
 
-function Get-EnterpriseCas {
+function Invoke-MachineCertificateEnrollment {
     param(
         [Parameter(Mandatory)]
-        [string]$DomainController
+        [string]$TemplateName
     )
 
-    $configurationNc = Get-RootDseProperty `
-        -DomainController $DomainController `
-        -PropertyName 'configurationNamingContext'
+    Write-Host "Requesting machine certificate from template '$TemplateName'..."
 
-    if ([string]::IsNullOrWhiteSpace($configurationNc)) {
-        throw "The Configuration naming context was empty on '$DomainController'."
+    $output = @(
+        & certreq.exe `
+            -enroll `
+            -machine `
+            -q `
+            $TemplateName 2>&1
+    )
+    $exitCode = $LASTEXITCODE
+
+    foreach ($line in $output) {
+        Write-Host "  $line"
     }
 
-    $containerDn = @(
-        'CN=Enrollment Services'
-        'CN=Public Key Services'
-        'CN=Services'
-        $configurationNc
-    ) -join ','
-
-    $ldapPath = "LDAP://$DomainController/$containerDn"
-
-    $root = New-Object System.DirectoryServices.DirectoryEntry `
-        -ArgumentList @(
-            $ldapPath,
-            $null,
-            $null,
-            [System.DirectoryServices.AuthenticationTypes]::Secure
-        )
-
-    $searcher = New-Object System.DirectoryServices.DirectorySearcher `
-        -ArgumentList $root
-
-    $searcher.Filter = '(objectClass=pKIEnrollmentService)'
-    $searcher.SearchScope =
-        [System.DirectoryServices.SearchScope]::OneLevel
-    $searcher.PageSize = 100
-
-    foreach ($property in @(
-        'cn',
-        'dNSHostName',
-        'certificateTemplates'
-    )) {
-        [void]$searcher.PropertiesToLoad.Add($property)
+    if ($exitCode -eq 0) {
+        Write-Host '[OK] Certificate enrollment request completed.' `
+            -ForegroundColor Green
+        return $true
     }
 
-    try {
-        $results = @($searcher.FindAll())
-        $cas = @()
+    Write-Warning @"
+certreq enrollment returned exit code $exitCode.
 
-        foreach ($result in $results) {
-            $name = ''
-            if ($result.Properties['cn'].Count -gt 0) {
-                $name = [string]$result.Properties['cn'][0]
-            }
-
-            $hostName = ''
-            if ($result.Properties['dnshostname'].Count -gt 0) {
-                $hostName =
-                    [string]$result.Properties['dnshostname'][0]
-            }
-
-            $templates = @()
-            if ($result.Properties['certificatetemplates'].Count -gt 0) {
-                $templates = @(
-                    $result.Properties['certificatetemplates'] |
-                    ForEach-Object { [string]$_ }
-                )
-            }
-
-            $configuration = ''
-            if (
-                -not [string]::IsNullOrWhiteSpace($hostName) -and
-                -not [string]::IsNullOrWhiteSpace($name)
-            ) {
-                $configuration = "$hostName\$name"
-            }
-
-            $cas += [pscustomobject]@{
-                Name = $name
-                DnsHostName = $hostName
-                Configuration = $configuration
-                CertificateTemplates = $templates
-            }
-        }
-
-        return $cas
-    }
-    catch {
-        throw @"
-Failed to search Enterprise CA objects through '$ldapPath'.
-
-$($_.Exception.Message)
+This usually means one of the following:
+  - The template is not published on an Enterprise CA.
+  - The computer lacks Read, Enroll, or Autoenroll permission.
+  - The template internal name is incorrect.
+  - No Enterprise CA is reachable through certificate enrollment policy.
 "@
-    }
-    finally {
-        $searcher.Dispose()
-        $root.Dispose()
-    }
+
+    return $false
 }
 
 function Test-SuitableCertificate {
@@ -337,63 +228,20 @@ if (-not $ldapTest.TcpTestSucceeded) {
 
 Write-Host '[OK] LDAP TCP 389 is reachable.' -ForegroundColor Green
 
-Write-Step 'Checking Enterprise CA publication'
-$cas = @()
+Write-Step 'Checking certificate enrollment client'
+$certreqCommand = Get-Command certreq.exe -ErrorAction SilentlyContinue
+$certutilCommand = Get-Command certutil.exe -ErrorAction SilentlyContinue
 
-try {
-    $cas = @(
-        Get-EnterpriseCas `
-            -DomainController $domainController
-    )
-}
-catch {
-    Write-Warning $_.Exception.Message
-    Write-Warning @'
-Enterprise CA discovery through LDAP failed. The script will still refresh
-Group Policy, trigger certificate auto-enrollment, and attempt WinRM repair.
-Review DNS, LDAP, secure-channel, and firewall connectivity if enrollment fails.
-'@
+if ($null -eq $certreqCommand) {
+    throw 'certreq.exe is unavailable on this server.'
 }
 
-if ($cas.Count -eq 0) {
-    Write-Warning 'No Enterprise CA publication objects were returned to this node.'
+if ($null -eq $certutilCommand) {
+    throw 'certutil.exe is unavailable on this server.'
 }
 
-$templatePublished = $false
-
-foreach ($ca in $cas) {
-    Write-Host "CA: $($ca.Configuration)"
-    Write-Host "Published templates: $($ca.CertificateTemplates.Count)"
-
-    if (
-        $ca.CertificateTemplates -contains $TemplateInternalName -or
-        $ca.CertificateTemplates -contains $TemplateDisplayName
-    ) {
-        $templatePublished = $true
-        Write-Host "[OK] Template is published by this CA." `
-            -ForegroundColor Green
-    }
-
-    if (-not [string]::IsNullOrWhiteSpace($ca.DnsHostName)) {
-        Resolve-DnsName `
-            -Name $ca.DnsHostName `
-            -ErrorAction Stop |
-            Select-Object Name, IPAddress |
-            Format-Table -AutoSize
-
-        & certutil.exe -config $ca.Configuration -ping
-        if ($LASTEXITCODE -ne 0) {
-            Write-Warning "Could not contact CA '$($ca.Configuration)'. Check RPC and firewall connectivity."
-        }
-    }
-}
-
-if ($cas.Count -gt 0 -and -not $templatePublished) {
-    throw "Template '$TemplateInternalName' is not published by any discovered Enterprise CA."
-}
-elseif ($cas.Count -eq 0) {
-    Write-Warning 'Template publication could not be verified because Enterprise CA discovery failed.'
-}
+Write-Host '[OK] Native certificate enrollment tools are available.' `
+    -ForegroundColor Green
 
 Write-Step 'Refreshing Group Policy and certificate enrollment'
 & gpupdate.exe /target:computer /force
@@ -405,6 +253,10 @@ if ($LASTEXITCODE -ne 0) {
 if ($LASTEXITCODE -ne 0) {
     Write-Warning "certutil -pulse returned exit code $LASTEXITCODE."
 }
+
+$enrollmentSucceeded =
+    Invoke-MachineCertificateEnrollment `
+        -TemplateName $TemplateInternalName
 
 Start-Sleep -Seconds $EnrollmentWaitSeconds
 
@@ -420,14 +272,18 @@ $certificate = Get-ChildItem Cert:\LocalMachine\My |
 
 if ($null -eq $certificate) {
     throw @"
-No suitable certificate was found in Cert:\LocalMachine\My.
+No suitable certificate was found in Cert:\LocalMachine\My after both
+auto-enrollment and an explicit certreq machine enrollment attempt.
 
 Verify:
-  - The computer account is a member of the enrollment security group.
-  - The server has restarted since it was added to that group.
-  - The template grants Read, Enroll, and Autoenroll.
-  - The template includes the computer DNS name and Server Authentication EKU.
-  - Certificate enrollment event logs contain no errors.
+  - The template internal name is '$TemplateInternalName'.
+  - The template is published on the issuing Enterprise CA.
+  - The computer account has Read, Enroll, and Autoenroll permission.
+  - The computer has restarted after enrollment-group membership changed.
+  - The template supplies the computer DNS name and Server Authentication EKU.
+
+Run this command separately to see the native enrollment error:
+  certreq.exe -enroll -machine $TemplateInternalName
 "@
 }
 
