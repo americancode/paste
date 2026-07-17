@@ -1,6 +1,12 @@
 # Run as Administrator
 
-$NewComputerName = 'SQLVM01'
+Enable-NetFirewallRule -DisplayGroup "Remote Scheduled Tasks Management"
+Enable-NetFirewallRule -DisplayGroup "Windows Management Instrumentation (WMI)"
+Enable-NetFirewallRule -DisplayGroup "Remote Service Management"
+Enable-NetFirewallRule -DisplayGroup "File and Printer Sharing"
+
+
+$NewComputerName = 'REPLACE_ME'
 $DomainName      = 'compy.local'
 $OUPath          = 'OU=SQL,OU=Servers,DC=compy,DC=local'
 $DnsServer       = '172.21.4.100'
