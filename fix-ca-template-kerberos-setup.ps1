@@ -1,7 +1,7 @@
 #requires -Version 5.1
 #requires -RunAsAdministrator
 
-# Rebuilt v4 2026-07-17: fixes AD constraint violation during template creation.
+# Rebuilt v5 2026-07-17: idempotent controlled template creation and recovery.
 
 <#
 .SYNOPSIS
@@ -313,89 +313,155 @@ function New-UniqueCertificateTemplateOid {
     return $candidate
 }
 
+function ConvertTo-AdIntervalBytes {
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateRange(1, 3650)]
+        [int]$Days
+    )
+
+    # AD stores certificate-template durations as a negative 100-nanosecond
+    # interval in little-endian signed 64-bit form.
+    $ticks = -1L * [int64]$Days * 24L * 60L * 60L * 10000000L
+    return [System.BitConverter]::GetBytes($ticks)
+}
+
+function Test-CertificateTemplateUsable {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.DirectoryServices.DirectoryEntry]$Template
+    )
+
+    $required = @(
+        'cn',
+        'displayName',
+        'msPKI-Cert-Template-OID',
+        'msPKI-Template-Schema-Version',
+        'pKIExpirationPeriod',
+        'pKIOverlapPeriod'
+    )
+
+    foreach ($name in $required) {
+        if ($Template.Properties[$name].Count -eq 0) {
+            return $false
+        }
+    }
+
+    return $true
+}
+
 function New-CertificateTemplateFromBase {
     param(
         [Parameter(Mandatory = $true)][string]$BaseName,
         [Parameter(Mandatory = $true)][string]$InternalName,
-        [Parameter(Mandatory = $true)][string]$DisplayName
+        [Parameter(Mandatory = $true)][string]$DisplayName,
+        [Parameter(Mandatory = $true)][int]$KeySize
     )
 
+    # First check both identifiers. This makes reruns safe after a successful
+    # prior creation or after AD replication exposes the object by either name.
+    $existing = Find-TemplateDirectoryEntry -Name $InternalName
+    if ($null -eq $existing) {
+        $existing = Find-TemplateDirectoryEntry -Name $DisplayName
+    }
+
+    if ($null -ne $existing) {
+        if (-not (Test-CertificateTemplateUsable -Template $existing)) {
+            $dn = [string]$existing.Properties['distinguishedName'].Value
+            $existing.Dispose()
+            throw "A certificate-template object already exists but is incomplete: '$dn'. Remove or repair that object, then rerun. The script will not delete an existing AD object automatically."
+        }
+
+        Write-Success "Using existing certificate template '$DisplayName'."
+        return $existing
+    }
+
+    # Confirm the requested source exists, but do not bulk-copy every source
+    # attribute. Bulk copying operational/system attributes is what caused the
+    # LDAP constraint violations in earlier versions.
     $baseTemplate = Find-TemplateDirectoryEntry -Name $BaseName
     if ($null -eq $baseTemplate) {
-        throw "Base certificate template '$BaseName' was not found. Verify the built-in Web Server template exists in certtmpl.msc."
+        throw "Base certificate template '$BaseName' was not found."
     }
-
-    $existingInternal = Find-TemplateDirectoryEntry -Name $InternalName
-    if ($null -ne $existingInternal) {
-        return $existingInternal
-    }
-
-    $containerDn = Get-CertificateTemplateContainerDn
-    $container = New-Object -TypeName System.DirectoryServices.DirectoryEntry -ArgumentList "LDAP://$containerDn"
-
-    # Attributes maintained by AD or unique to the new object are not copied.
-    $excludedProperties = @(
-        'adspath', 'allowedattributes', 'allowedattributeseffective',
-        'allowedchildclasses', 'allowedchildclasseseffective', 'canonicalname',
-        'cn', 'createTimeStamp', 'distinguishedName', 'dSCorePropagationData',
-        'instanceType', 'isCriticalSystemObject', 'modifyTimeStamp', 'name',
-        'nTSecurityDescriptor', 'objectCategory', 'objectClass', 'objectGUID',
-        'uSNChanged', 'uSNCreated', 'whenChanged', 'whenCreated',
-        'msPKI-Cert-Template-OID', 'displayName'
-    )
-
-    $newTemplate = $null
 
     try {
-        Write-InfoMessage "Duplicating certificate template '$BaseName' as '$DisplayName'."
-        $newTemplate = $container.Children.Add("CN=$InternalName", 'pKICertificateTemplate')
-
-        foreach ($propertyName in $baseTemplate.Properties.PropertyNames) {
-            if ($propertyName -in $excludedProperties) {
-                continue
-            }
-
-            $values = @($baseTemplate.Properties[$propertyName])
-            if ($values.Count -eq 0) {
-                continue
-            }
-
-            try {
-                $newTemplate.Properties[$propertyName].Clear()
-                foreach ($value in $values) {
-                    [void]$newTemplate.Properties[$propertyName].Add($value)
-                }
-            }
-            catch {
-                Write-WarningMessage "Skipped non-copyable template property '$propertyName': $($_.Exception.Message)"
-            }
+        $schemaVersion = 2
+        if ($baseTemplate.Properties['msPKI-Template-Schema-Version'].Count -gt 0) {
+            $schemaVersion = [Math]::Max(2, [int]$baseTemplate.Properties['msPKI-Template-Schema-Version'].Value)
         }
 
-        $newTemplate.Properties['displayName'].Value = $DisplayName
-        $newTemplate.Properties['msPKI-Cert-Template-OID'].Value = New-UniqueCertificateTemplateOid
+        $templateOid = New-UniqueCertificateTemplateOid
+        $containerDn = Get-CertificateTemplateContainerDn
+        $templateDn = "CN=$InternalName,$containerDn"
 
-        # Preserve the source template major revision. The minor revision is
-        # copied with the other editable attributes and will be incremented
-        # when the template settings are committed later in this script.
-        if ($null -ne $baseTemplate.Properties['revision'].Value) {
-            $newTemplate.Properties['revision'].Value =
-                [int]$baseTemplate.Properties['revision'].Value
+        $attributes = @{
+            displayName                               = $DisplayName
+            flags                                     = 131680
+            revision                                  = 100
+            pKIDefaultKeySpec                         = 1
+            pKIKeyUsage                               = [byte[]](0xA0)
+            pKIMaxIssuingDepth                        = 0
+            pKICriticalExtensions                     = @('2.5.29.15')
+            pKIExpirationPeriod                       = [byte[]](ConvertTo-AdIntervalBytes -Days 730)
+            pKIOverlapPeriod                          = [byte[]](ConvertTo-AdIntervalBytes -Days 42)
+            pKIExtendedKeyUsage                       = @('1.3.6.1.5.5.7.3.1')
+            'msPKI-Cert-Template-OID'                 = $templateOid
+            'msPKI-Certificate-Application-Policy'   = @('1.3.6.1.5.5.7.3.1')
+            'msPKI-Certificate-Name-Flag'             = 0x18000000
+            'msPKI-Enrollment-Flag'                   = 0x20
+            'msPKI-Minimal-Key-Size'                  = $KeySize
+            'msPKI-Private-Key-Flag'                  = 0
+            'msPKI-RA-Signature'                      = 0
+            'msPKI-Template-Minor-Revision'           = 0
+            'msPKI-Template-Schema-Version'           = $schemaVersion
         }
 
-        $newTemplate.CommitChanges()
-        $newTemplate.RefreshCache()
+        Write-InfoMessage "Creating certificate template '$DisplayName' with a controlled attribute set."
+
+        try {
+            New-ADObject `
+                -Name $InternalName `
+                -Type 'pKICertificateTemplate' `
+                -Path $containerDn `
+                -OtherAttributes $attributes `
+                -ErrorAction Stop
+        }
+        catch {
+            # A concurrent run or replication race may have created it after
+            # our initial lookup. Re-query before treating the operation as a
+            # hard failure.
+            $raceWinner = Find-TemplateDirectoryEntry -Name $InternalName
+            if ($null -eq $raceWinner) {
+                $raceWinner = Find-TemplateDirectoryEntry -Name $DisplayName
+            }
+
+            if ($null -ne $raceWinner -and (Test-CertificateTemplateUsable -Template $raceWinner)) {
+                Write-WarningMessage 'Another run created the template concurrently; continuing with the existing object.'
+                return $raceWinner
+            }
+
+            $detail = $_.Exception.Message
+            if ($_.Exception.InnerException) {
+                $detail = "$detail Inner: $($_.Exception.InnerException.Message)"
+            }
+            throw "Failed to create certificate template '$DisplayName' at '$templateDn': $detail"
+        }
+
+        $created = Find-TemplateDirectoryEntry -Name $InternalName
+        if ($null -eq $created) {
+            throw "The template create operation returned successfully, but '$templateDn' could not be read back from Active Directory."
+        }
+
+        if (-not (Test-CertificateTemplateUsable -Template $created)) {
+            $created.Dispose()
+            throw "The new template '$templateDn' was created but failed post-create validation."
+        }
+
         Write-Success "Created certificate template '$DisplayName' (internal name '$InternalName')."
-        return $newTemplate
-    }
-    catch {
-        if ($null -ne $newTemplate) {
-            try { $newTemplate.Dispose() } catch { }
-        }
-        throw "Failed to duplicate certificate template '$BaseName': $($_.Exception.Message) (Extended: $($_.Exception.ExtendedErrorMessage))"
+        return $created
     }
     finally {
         $baseTemplate.Dispose()
-        $container.Dispose()
     }
 }
 
@@ -404,7 +470,8 @@ function Get-OrCreateTemplateDirectoryEntry {
         [Parameter(Mandatory = $true)][string]$Name,
         [Parameter(Mandatory = $true)][string]$InternalName,
         [Parameter(Mandatory = $true)][string]$BaseName,
-        [Parameter(Mandatory = $true)][bool]$CreateIfMissing
+        [Parameter(Mandatory = $true)][bool]$CreateIfMissing,
+        [Parameter(Mandatory = $true)][int]$KeySize
     )
 
     $template = Find-TemplateDirectoryEntry -Name $Name
@@ -425,7 +492,8 @@ Then rerun the script, or rerun with -CreateTemplateIfMissing `$true.
     return New-CertificateTemplateFromBase `
         -BaseName $BaseName `
         -InternalName $InternalName `
-        -DisplayName $Name
+        -DisplayName $Name `
+        -KeySize $KeySize
 }
 
 function Get-LocalEnterpriseCa {
@@ -668,7 +736,8 @@ try {
         -Name $TemplateName `
         -InternalName $TemplateInternalName `
         -BaseName $BaseTemplateName `
-        -CreateIfMissing $CreateTemplateIfMissing
+        -CreateIfMissing $CreateTemplateIfMissing `
+        -KeySize $MinimumKeySize
     $internalTemplateName = [string]$template.Properties['cn'].Value
     $templateDisplayName = [string]$template.Properties['displayName'].Value
     Write-Success "Internal template name: $internalTemplateName"
