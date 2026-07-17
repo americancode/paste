@@ -432,13 +432,14 @@ function Test-MachineCertificates {
     }
 
     $results |
-        Sort-Object Suitable -Descending, NotAfter -Descending |
+        Sort-Object `
+            @{Expression='Suitable';Descending=$true},
+            @{Expression='NotAfter';Descending=$true} |
         Format-List
-
-    $suitableCertificates = @(
-        $results |
-        Where-Object Suitable
-    )
+        $suitableCertificates = @(
+            $results |
+            Where-Object Suitable
+        )
 
     if ($suitableCertificates.Count -gt 0) {
         Write-Pass "$($suitableCertificates.Count) suitable WinRM HTTPS certificate(s) found."
