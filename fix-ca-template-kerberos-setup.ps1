@@ -1,6 +1,8 @@
 #requires -Version 5.1
 #requires -RunAsAdministrator
 
+# Script version: 7
+
 # Rebuilt v5 2026-07-17: idempotent controlled template creation and recovery.
 
 <#
@@ -713,7 +715,16 @@ function Configure-AutoEnrollmentGpo {
     Write-Success 'Configured computer certificate auto-enrollment policy.'
 
     $inheritance = Get-GPInheritance -Target $TargetOu -ErrorAction Stop
-    $existingLink = @($inheritance.GpoLinks | Where-Object { $_.DisplayName -eq $GpoName })
+    $existingLink = @(
+        $inheritance.GpoLinks |
+            Where-Object {
+                $displayNameProperty = $_.PSObject.Properties['DisplayName']
+                $nameProperty = $_.PSObject.Properties['Name']
+
+                ($displayNameProperty -and ([string]$displayNameProperty.Value -eq $GpoName)) -or
+                ($nameProperty -and ([string]$nameProperty.Value -eq $GpoName))
+            }
+    )
 
     if ($existingLink.Count -eq 0) {
         New-GPLink -Name $GpoName -Target $TargetOu -LinkEnabled Yes -ErrorAction Stop | Out-Null
@@ -817,7 +828,13 @@ try {
 
     Write-Host ''
     Write-Host 'Certificate template:' -ForegroundColor White
-    $publishedTemplate | Select-Object -Property Name, OID | Format-List
+    $publishedNameProperty = $publishedTemplate.PSObject.Properties['Name']
+    $publishedOidProperty = $publishedTemplate.PSObject.Properties['OID']
+
+    [pscustomobject]@{
+        Name = if ($publishedNameProperty) { [string]$publishedNameProperty.Value } else { $internalTemplateName }
+        OID  = if ($publishedOidProperty) { [string]$publishedOidProperty.Value } else { '<not exposed by this ADCSAdministration version>' }
+    } | Format-List
 
     Write-Host ''
     Write-Host 'Enrollment group:' -ForegroundColor White
