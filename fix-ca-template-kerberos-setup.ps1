@@ -634,23 +634,53 @@ function Repair-CertificateTemplate {
     $Template.RefreshCache()
 }
 
-function Publish-CertificateTemplate {
+function Get-PublishedCaTemplate {
     param(
-        [Parameter(Mandatory = $true)][string]$InternalName,
-        [Parameter(Mandatory = $true)][string]$DisplayName
+        [Parameter(Mandatory = $true)][string]$InternalName
     )
 
-    $existingTemplate = Get-CATemplate -ErrorAction Stop |
-        Where-Object { $_.Name -eq $InternalName -or $_.DisplayName -eq $DisplayName } |
-        Select-Object -First 1
+    return @(
+        Get-CATemplate -ErrorAction Stop |
+            Where-Object {
+                $nameProperty = $_.PSObject.Properties['Name']
+                $nameProperty -and ([string]$nameProperty.Value -eq $InternalName)
+            }
+    ) | Select-Object -First 1
+}
 
+function Publish-CertificateTemplate {
+    param(
+        [Parameter(Mandatory = $true)][string]$InternalName
+    )
+
+    $existingTemplate = Get-PublishedCaTemplate -InternalName $InternalName
     if ($null -ne $existingTemplate) {
-        Write-Success 'Certificate template is already published on this CA.'
-        return
+        Write-Success "Certificate template '$InternalName' is already published on this CA."
+        return $existingTemplate
     }
 
-    Add-CATemplate -Name $InternalName -Force -ErrorAction Stop
-    Write-Success 'Certificate template was published on this CA.'
+    try {
+        Add-CATemplate -Name $InternalName -Force -ErrorAction Stop
+    }
+    catch {
+        # Another invocation or CA refresh may have published it between the
+        # initial check and Add-CATemplate. Re-query before treating it as fatal.
+        $existingTemplate = Get-PublishedCaTemplate -InternalName $InternalName
+        if ($null -ne $existingTemplate) {
+            Write-Success "Certificate template '$InternalName' is already published on this CA."
+            return $existingTemplate
+        }
+
+        throw
+    }
+
+    $publishedTemplate = Get-PublishedCaTemplate -InternalName $InternalName
+    if ($null -eq $publishedTemplate) {
+        throw "Certificate template '$InternalName' was added but could not be verified as published."
+    }
+
+    Write-Success "Certificate template '$InternalName' was published on this CA."
+    return $publishedTemplate
 }
 
 function Configure-AutoEnrollmentGpo {
@@ -755,7 +785,7 @@ try {
     Write-Success 'Certificate template settings and permissions were updated.'
 
     Write-Step 'Publishing the certificate template'
-    Publish-CertificateTemplate -InternalName $internalTemplateName -DisplayName $templateDisplayName
+    $publishedTemplate = Publish-CertificateTemplate -InternalName $internalTemplateName
 
     Write-Step 'Configuring certificate auto-enrollment Group Policy'
     Configure-AutoEnrollmentGpo -GpoName $AutoEnrollmentGpoName -TargetOu $ServerOu
@@ -773,12 +803,10 @@ try {
     }
 
     Write-Step 'Final verification'
-    $publishedTemplate = Get-CATemplate -ErrorAction Stop |
-        Where-Object { $_.Name -eq $internalTemplateName -or $_.DisplayName -eq $templateDisplayName } |
-        Select-Object -First 1
+    $publishedTemplate = Get-PublishedCaTemplate -InternalName $internalTemplateName
 
     if ($null -eq $publishedTemplate) {
-        throw 'The certificate template could not be verified as published.'
+        throw "The certificate template '$internalTemplateName' could not be verified as published."
     }
 
     $finalMembers = @(
@@ -789,7 +817,7 @@ try {
 
     Write-Host ''
     Write-Host 'Certificate template:' -ForegroundColor White
-    $publishedTemplate | Format-List Name, DisplayName, OID
+    $publishedTemplate | Select-Object -Property Name, OID | Format-List
 
     Write-Host ''
     Write-Host 'Enrollment group:' -ForegroundColor White
