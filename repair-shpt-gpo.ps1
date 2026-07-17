@@ -22,7 +22,7 @@ param(
     [string]$TemplateInternalName = 'AnsibleWinRMHTTPS',
     [string]$TemplateDisplayName = 'Ansible WinRM HTTPS',
     [string]$BaseTemplateName = 'WebServer',
-    [string]$EnrollmentGroupName = 'SharePoint WinRM Certificate Enrollment',
+    [string]$EnrollmentGroupName = 'WinRM HTTPS SharePoint Servers',
     [int]$MinimumKeySize = 2048
 )
 
@@ -128,6 +128,102 @@ function Add-AllowRule {
     }
 
     [void]$Security.AddAccessRule($rule)
+}
+
+function ConvertTo-LdapFilterValue {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Value
+    )
+
+    $builder = New-Object System.Text.StringBuilder
+
+    foreach ($character in $Value.ToCharArray()) {
+        switch ([int][char]$character) {
+            0  { [void]$builder.Append('\00'); continue }
+            40 { [void]$builder.Append('\28'); continue }
+            41 { [void]$builder.Append('\29'); continue }
+            42 { [void]$builder.Append('\2a'); continue }
+            92 { [void]$builder.Append('\5c'); continue }
+            default { [void]$builder.Append($character) }
+        }
+    }
+
+    return $builder.ToString()
+}
+
+function Get-EnrollmentGroup {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Name
+    )
+
+    $group = Get-ADGroup `
+        -Identity $Name `
+        -Properties SID, DisplayName, SamAccountName `
+        -ErrorAction SilentlyContinue
+
+    if ($null -ne $group) {
+        return $group
+    }
+
+    $escaped = ConvertTo-LdapFilterValue -Value $Name
+
+    $matches = @(
+        Get-ADGroup `
+            -LDAPFilter "(|(cn=$escaped)(name=$escaped)(displayName=$escaped)(sAMAccountName=$escaped))" `
+            -Properties SID, DisplayName, SamAccountName `
+            -ErrorAction Stop
+    )
+
+    if ($matches.Count -eq 1) {
+        return $matches[0]
+    }
+
+    if ($matches.Count -gt 1) {
+        $details = $matches |
+            Select-Object Name, SamAccountName, DistinguishedName |
+            Format-Table -AutoSize |
+            Out-String
+
+        throw @"
+Multiple AD groups matched '$Name'. Rerun with -EnrollmentGroupName set to
+the exact sAMAccountName or distinguished name.
+
+$details
+"@
+    }
+
+    $candidateGroups = @(
+        Get-ADGroup `
+            -Filter "Name -like '*WinRM*' -or Name -like '*SharePoint*'" `
+            -Properties DisplayName, SamAccountName `
+            -ErrorAction SilentlyContinue |
+        Select-Object Name, SamAccountName, DistinguishedName
+    )
+
+    $candidateText = if ($candidateGroups.Count -gt 0) {
+        $candidateGroups |
+            Format-Table -AutoSize |
+            Out-String
+    }
+    else {
+        '<No WinRM or SharePoint groups were found.>'
+    }
+
+    throw @"
+Enrollment group '$Name' was not found.
+
+The original idempotent CA script uses this default group:
+  WinRM HTTPS SharePoint Servers
+
+Rerun this repair with the correct group, for example:
+  .\Repair-SharePoint-WinRM-CertificateTemplate-v9.ps1 `
+      -EnrollmentGroupName 'WinRM HTTPS SharePoint Servers'
+
+Possible matching groups:
+$candidateText
+"@
 }
 
 function Ensure-TemplatePermissions {
@@ -257,10 +353,11 @@ $template.RefreshCache()
 Write-Host '[OK] Template attributes committed.' -ForegroundColor Green
 
 Write-Step 'Repairing template permissions'
-$group = Get-ADGroup `
-    -Identity $EnrollmentGroupName `
-    -Properties SID `
-    -ErrorAction Stop
+$group = Get-EnrollmentGroup `
+    -Name $EnrollmentGroupName
+
+Write-Host "[OK] Enrollment group: $($group.DistinguishedName)" `
+    -ForegroundColor Green
 
 $caComputer = Get-ADComputer `
     -Identity $env:COMPUTERNAME `
