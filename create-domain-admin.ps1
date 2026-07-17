@@ -63,7 +63,7 @@ ForEach-Object {
 
 Write-Host "Successfully cloned $SourceUser to $NewSamAccountName"
 
-$password = Read-Host "Password" -AsSecureString
+# $password = Read-Host "Password" -AsSecureString
 
 # .\Clone-ADUser.ps1 `
 #     -SourceUser "jsmith" `
