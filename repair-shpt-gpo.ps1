@@ -23,7 +23,8 @@ param(
     [string]$TemplateDisplayName = 'Ansible WinRM HTTPS',
     [string]$BaseTemplateName = 'WebServer',
     [string]$EnrollmentGroupName = 'WinRM HTTPS SharePoint Servers',
-    [int]$MinimumKeySize = 2048
+    [int]$MinimumKeySize = 2048,
+    [switch]$DoNotCreateEnrollmentGroup
 )
 
 Set-StrictMode -Version 2.0
@@ -155,23 +156,18 @@ function ConvertTo-LdapFilterValue {
 function Get-EnrollmentGroup {
     param(
         [Parameter(Mandatory)]
-        [string]$Name
+        [string]$Name,
+
+        [switch]$DoNotCreate
     )
-
-    $group = Get-ADGroup `
-        -Identity $Name `
-        -Properties SID, DisplayName, SamAccountName `
-        -ErrorAction SilentlyContinue
-
-    if ($null -ne $group) {
-        return $group
-    }
 
     $escaped = ConvertTo-LdapFilterValue -Value $Name
 
     $matches = @(
         Get-ADGroup `
             -LDAPFilter "(|(cn=$escaped)(name=$escaped)(displayName=$escaped)(sAMAccountName=$escaped))" `
+            -SearchBase (Get-ADDomain).DistinguishedName `
+            -SearchScope Subtree `
             -Properties SID, DisplayName, SamAccountName `
             -ErrorAction Stop
     )
@@ -188,42 +184,36 @@ function Get-EnrollmentGroup {
 
         throw @"
 Multiple AD groups matched '$Name'. Rerun with -EnrollmentGroupName set to
-the exact sAMAccountName or distinguished name.
+the exact sAMAccountName.
 
 $details
 "@
     }
 
-    $candidateGroups = @(
-        Get-ADGroup `
-            -Filter "Name -like '*WinRM*' -or Name -like '*SharePoint*'" `
-            -Properties DisplayName, SamAccountName `
-            -ErrorAction SilentlyContinue |
-        Select-Object Name, SamAccountName, DistinguishedName
-    )
-
-    $candidateText = if ($candidateGroups.Count -gt 0) {
-        $candidateGroups |
-            Format-Table -AutoSize |
-            Out-String
-    }
-    else {
-        '<No WinRM or SharePoint groups were found.>'
+    if ($DoNotCreate) {
+        throw "Enrollment group '$Name' was not found."
     }
 
-    throw @"
-Enrollment group '$Name' was not found.
+    $domain = Get-ADDomain -ErrorAction Stop
+    $groupPath = $domain.UsersContainer
 
-The original idempotent CA script uses this default group:
-  WinRM HTTPS SharePoint Servers
+    Write-Warning "Enrollment group '$Name' was not found."
+    Write-Host "Creating a new Global Security group in '$groupPath'..."
 
-Rerun this repair with the correct group, for example:
-  .\Repair-SharePoint-WinRM-CertificateTemplate-v9.ps1 `
-      -EnrollmentGroupName 'WinRM HTTPS SharePoint Servers'
+    $newGroup = New-ADGroup `
+        -Name $Name `
+        -SamAccountName $Name `
+        -DisplayName $Name `
+        -GroupCategory Security `
+        -GroupScope Global `
+        -Path $groupPath `
+        -PassThru `
+        -ErrorAction Stop
 
-Possible matching groups:
-$candidateText
-"@
+    return Get-ADGroup `
+        -Identity $newGroup.DistinguishedName `
+        -Properties SID, DisplayName, SamAccountName `
+        -ErrorAction Stop
 }
 
 function Ensure-TemplatePermissions {
@@ -354,7 +344,8 @@ Write-Host '[OK] Template attributes committed.' -ForegroundColor Green
 
 Write-Step 'Repairing template permissions'
 $group = Get-EnrollmentGroup `
-    -Name $EnrollmentGroupName
+    -Name $EnrollmentGroupName `
+    -DoNotCreate:$DoNotCreateEnrollmentGroup
 
 Write-Host "[OK] Enrollment group: $($group.DistinguishedName)" `
     -ForegroundColor Green
