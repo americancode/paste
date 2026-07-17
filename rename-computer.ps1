@@ -1,4 +1,5 @@
+$cred = Get-Credential
 Rename-Computer `
     -NewName "NEW-COMPUTER-NAME" `
-    -LocalCredential (Get-Credential) `
+    -DomainCredential $cred `
     -Restart
