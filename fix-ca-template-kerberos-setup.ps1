@@ -1,7 +1,7 @@
 #requires -Version 5.1
 #requires -RunAsAdministrator
 
-# Rebuilt v3 2026-07-17: SharePoint edition; creates the custom template when missing.
+# Rebuilt v4 2026-07-17: fixes AD constraint violation during template creation.
 
 <#
 .SYNOPSIS
@@ -273,20 +273,35 @@ function Find-TemplateDirectoryEntry {
 }
 
 function New-UniqueCertificateTemplateOid {
-    param([Parameter(Mandatory = $true)][string]$BaseOid)
+    <#
+        Generates a forest-unique certificate-template OID that remains below
+        the AD schema limit for msPKI-Cert-Template-OID (64 characters).
 
+        Do not append values to the source template OID: built-in template OIDs
+        can already be long enough that appended arcs cause LDAP constraint
+        violations during CommitChanges().
+    #>
     $containerDn = Get-CertificateTemplateContainerDn
 
     do {
-        $randomArc1 = Get-Random -Minimum 10000000 -Maximum 2147483647
-        $randomArc2 = Get-Random -Minimum 10000000 -Maximum 2147483647
-        $candidate = "$BaseOid.$randomArc1.$randomArc2"
-        $escapedOid = ConvertTo-LdapFilterValue -Value $candidate
+        # Microsoft enterprise certificate-template OIDs use this namespace.
+        # Two positive 31-bit arcs provide ample uniqueness and keep the
+        # complete value comfortably below the 64-character schema limit.
+        $arc1 = Get-Random -Minimum 100000000 -Maximum 2147483647
+        $arc2 = Get-Random -Minimum 100000000 -Maximum 2147483647
+        $candidate = "1.3.6.1.4.1.311.21.8.$arc1.$arc2"
 
+        if ($candidate.Length -gt 64) {
+            throw "Generated template OID exceeds 64 characters: $candidate"
+        }
+
+        $escapedOid = ConvertTo-LdapFilterValue -Value $candidate
         $searchRoot = New-Object -TypeName System.DirectoryServices.DirectoryEntry -ArgumentList "LDAP://$containerDn"
         $searcher = New-Object -TypeName System.DirectoryServices.DirectorySearcher -ArgumentList $searchRoot
+
         try {
             $searcher.Filter = "(&(objectClass=pKICertificateTemplate)(msPKI-Cert-Template-OID=$escapedOid))"
+            $searcher.SearchScope = [System.DirectoryServices.SearchScope]::OneLevel
             $exists = $null -ne $searcher.FindOne()
         }
         finally {
@@ -356,20 +371,16 @@ function New-CertificateTemplateFromBase {
             }
         }
 
-        $baseOid = [string]$baseTemplate.Properties['msPKI-Cert-Template-OID'].Value
-        if ([string]::IsNullOrWhiteSpace($baseOid)) {
-            throw "Base template '$BaseName' does not contain msPKI-Cert-Template-OID."
-        }
-
         $newTemplate.Properties['displayName'].Value = $DisplayName
-        $newTemplate.Properties['msPKI-Cert-Template-OID'].Value = New-UniqueCertificateTemplateOid -BaseOid $baseOid
+        $newTemplate.Properties['msPKI-Cert-Template-OID'].Value = New-UniqueCertificateTemplateOid
 
-        # Increment the minor revision to distinguish the duplicate.
-        $minorRevision = 0
+        # Preserve the source template major revision. The minor revision is
+        # copied with the other editable attributes and will be incremented
+        # when the template settings are committed later in this script.
         if ($null -ne $baseTemplate.Properties['revision'].Value) {
-            $minorRevision = [int]$baseTemplate.Properties['revision'].Value
+            $newTemplate.Properties['revision'].Value =
+                [int]$baseTemplate.Properties['revision'].Value
         }
-        $newTemplate.Properties['revision'].Value = ($minorRevision + 1)
 
         $newTemplate.CommitChanges()
         $newTemplate.RefreshCache()
@@ -380,7 +391,7 @@ function New-CertificateTemplateFromBase {
         if ($null -ne $newTemplate) {
             try { $newTemplate.Dispose() } catch { }
         }
-        throw "Failed to duplicate certificate template '$BaseName': $($_.Exception.Message)"
+        throw "Failed to duplicate certificate template '$BaseName': $($_.Exception.Message) (Extended: $($_.Exception.ExtendedErrorMessage))"
     }
     finally {
         $baseTemplate.Dispose()
