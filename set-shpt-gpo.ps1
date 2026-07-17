@@ -1,436 +1,421 @@
+#requires -Version 5.1
 #requires -RunAsAdministrator
-#requires -Modules ActiveDirectory, GroupPolicy
+#requires -Modules ActiveDirectory, GroupPolicy, ADCSAdministration
 
-[CmdletBinding()]
+[CmdletBinding(SupportsShouldProcess)]
 param(
     [string]$GpoName = 'Servers - SharePoint',
-
-    # SharePoint server computer OU
     [string]$TargetOuDn,
-
-    # OU where both the AD user and security group will be created
-    [string]$ServiceAccountsOuDn,
-
-    [string]$ServiceAccountName = 's1-sharepoint-ansible',
-    [string]$AdminGroupName     = 's1-sharepoint-ansible-admins',
-
-    # Replace "*" with the Ansible controller IP or subnet when possible.
-    # Examples:
-    #   10.20.30.40
-    #   10.20.30.0/24
+    [string]$EnrollmentGroupName = 'WinRM HTTPS SharePoint Servers',
+    [string]$EnrollmentGroupSamAccountName = 'WinRM-HTTPS-SP-Servers',
+    [string]$EnrollmentGroupOuDn,
+    [string]$TemplateDisplayName = 'Ansible WinRM HTTPS',
+    [string]$TemplateInternalName = 'AnsibleWinRMHTTPS',
+    [string]$BaseTemplateInternalName = 'WebServer',
+    [ValidateRange(2048,16384)]
+    [int]$MinimumKeySize = 2048,
     [string]$WinRmIPv4Filter = '*',
-
-    # Keep HTTP/5985 enabled during migration. Set to $false after HTTPS is verified.
     [bool]$EnableWinRmHttp = $true,
-
-    # Configure machine certificate auto-enrollment policy. The CA template must
-    # already be published and grant the target computers Enroll/Autoenroll.
-    [bool]$EnableCertificateAutoEnrollment = $true,
-
-    [securestring]$AccountPassword
+    [switch]$DoNotAddAllComputersInTargetOu,
+    [string[]]$SharePointComputerNames
 )
 
-Set-StrictMode -Version Latest
+Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
-Import-Module ActiveDirectory
-Import-Module GroupPolicy
+Import-Module ActiveDirectory -ErrorAction Stop
+Import-Module GroupPolicy -ErrorAction Stop
+Import-Module ADCSAdministration -ErrorAction Stop
 
-$domain = Get-ADDomain
+$domain = Get-ADDomain -ErrorAction Stop
+$rootDse = Get-ADRootDSE -ErrorAction Stop
 
-if (-not $TargetOuDn) {
+if ([string]::IsNullOrWhiteSpace($TargetOuDn)) {
     $TargetOuDn = "OU=Sharepoint,OU=Servers,$($domain.DistinguishedName)"
 }
 
-if (-not $ServiceAccountsOuDn) {
-    $ServiceAccountsOuDn = "OU=Service Accounts,$($domain.DistinguishedName)"
+if ([string]::IsNullOrWhiteSpace($EnrollmentGroupOuDn)) {
+    $EnrollmentGroupOuDn = $domain.UsersContainer
 }
 
-if (-not $AccountPassword) {
-    $AccountPassword = Read-Host `
-        "Enter password for $($domain.NetBIOSName)\$ServiceAccountName" `
-        -AsSecureString
+function Write-Step {
+    param([Parameter(Mandatory)][string]$Message)
+    Write-Host ''
+    Write-Host ('=' * 78) -ForegroundColor Cyan
+    Write-Host $Message -ForegroundColor Cyan
+    Write-Host ('=' * 78) -ForegroundColor Cyan
 }
 
-function Assert-AdContainer {
-    param(
-        [Parameter(Mandatory)]
-        [string]$DistinguishedName
-    )
+function ConvertTo-LdapFilterValue {
+    param([Parameter(Mandatory)][string]$Value)
+
+    $builder = New-Object System.Text.StringBuilder
+    foreach ($character in $Value.ToCharArray()) {
+        switch ([int][char]$character) {
+            0  { [void]$builder.Append('\\00'); continue }
+            40 { [void]$builder.Append('\\28'); continue }
+            41 { [void]$builder.Append('\\29'); continue }
+            42 { [void]$builder.Append('\\2a'); continue }
+            92 { [void]$builder.Append('\\5c'); continue }
+            default { [void]$builder.Append($character) }
+        }
+    }
+    return $builder.ToString()
+}
+
+function Assert-AdObjectExists {
+    param([Parameter(Mandatory)][string]$DistinguishedName)
 
     try {
-        Get-ADObject `
-            -Identity $DistinguishedName `
-            -ErrorAction Stop |
-            Out-Null
+        Get-ADObject -Identity $DistinguishedName -ErrorAction Stop | Out-Null
     }
     catch {
-        throw "AD container not found or inaccessible: $DistinguishedName"
+        throw "AD object not found or inaccessible: $DistinguishedName"
     }
 }
 
-function Ensure-AdSecurityGroup {
-    param(
-        [Parameter(Mandatory)]
-        [string]$Name,
+function Get-CertificateTemplateContainerDn {
+    return "CN=Certificate Templates,CN=Public Key Services,CN=Services,$($rootDse.ConfigurationNamingContext)"
+}
 
-        [Parameter(Mandatory)]
-        [string]$Path
+function Get-OidContainerDn {
+    return "CN=OID,CN=Public Key Services,CN=Services,$($rootDse.ConfigurationNamingContext)"
+}
+
+function Get-CertificateTemplateObject {
+    param([Parameter(Mandatory)][string]$Name)
+
+    $escaped = ConvertTo-LdapFilterValue -Value $Name
+    $matches = @(
+        Get-ADObject `
+            -SearchBase (Get-CertificateTemplateContainerDn) `
+            -SearchScope OneLevel `
+            -LDAPFilter "(&(objectClass=pKICertificateTemplate)(|(cn=$escaped)(displayName=$escaped)))" `
+            -Properties * `
+            -ErrorAction Stop
     )
 
-    $group = Get-ADGroup `
-        -LDAPFilter "(sAMAccountName=$Name)" `
-        -Properties GroupCategory, GroupScope `
-        -ErrorAction SilentlyContinue
+    if ($matches.Count -gt 1) {
+        throw "Multiple certificate templates matched '$Name'."
+    }
 
-    if (-not $group) {
-        Write-Host "Creating security group '$Name' in '$Path'..."
+    if ($matches.Count -eq 1) {
+        return $matches[0]
+    }
 
+    return $null
+}
+
+function New-EnterpriseTemplateOid {
+    param([Parameter(Mandatory)][string]$DisplayName)
+
+    $oidContainerDn = Get-OidContainerDn
+    $forest = Get-ADForest -ErrorAction Stop
+    $forestHash = [math]::Abs($forest.RootDomain.GetHashCode())
+    $random = New-Object System.Random
+
+    for ($attempt = 1; $attempt -le 20; $attempt++) {
+        $part1 = $random.Next(10000000, 99999999)
+        $part2 = $random.Next(10000000, 99999999)
+        $part3 = [DateTime]::UtcNow.Ticks.ToString().Substring(8)
+        $oid = "1.3.6.1.4.1.311.21.8.$forestHash.$part1.$part2.$part3"
+        $cn = ([guid]::NewGuid().Guid).ToUpperInvariant()
+
+        try {
+            New-ADObject `
+                -Name $cn `
+                -Type 'msPKI-Enterprise-Oid' `
+                -Path $oidContainerDn `
+                -OtherAttributes @{
+                    displayName = $DisplayName
+                    'msPKI-Cert-Template-OID' = $oid
+                    flags = 1
+                } `
+                -ErrorAction Stop
+
+            return $oid
+        }
+        catch {
+            if ($attempt -eq 20) { throw }
+        }
+    }
+}
+
+function Ensure-CertificateTemplate {
+    $template = Get-CertificateTemplateObject -Name $TemplateInternalName
+    if ($null -eq $template) {
+        $template = Get-CertificateTemplateObject -Name $TemplateDisplayName
+    }
+
+    $base = Get-CertificateTemplateObject -Name $BaseTemplateInternalName
+    if ($null -eq $base) {
+        throw "Base certificate template '$BaseTemplateInternalName' was not found."
+    }
+
+    if ($null -eq $template) {
+        Write-Host "Creating certificate template '$TemplateDisplayName' from '$BaseTemplateInternalName'..."
+
+        $templateOid = New-EnterpriseTemplateOid -DisplayName $TemplateDisplayName
+        $attributes = @{}
+        $copyAttributes = @(
+            'flags','revision','pKIDefaultKeySpec','pKIKeyUsage',
+            'pKIMaxIssuingDepth','pKICriticalExtensions','pKIExpirationPeriod',
+            'pKIOverlapPeriod','msPKI-CSPs','msPKI-RA-Application-Policies',
+            'msPKI-RA-Policies','msPKI-Template-Schema-Version',
+            'msPKI-Template-Minor-Revision','msPKI-Private-Key-Flag',
+            'msPKI-Enrollment-Flag','msPKI-Certificate-Name-Flag',
+            'msPKI-Minimal-Key-Size','pKIExtendedKeyUsage',
+            'msPKI-Certificate-Application-Policy','msPKI-RA-Signature'
+        )
+
+        foreach ($attribute in $copyAttributes) {
+            $property = $base.PSObject.Properties[$attribute]
+            if ($null -ne $property -and $null -ne $property.Value) {
+                $attributes[$attribute] = $property.Value
+            }
+        }
+
+        $attributes['displayName'] = $TemplateDisplayName
+        $attributes['msPKI-Cert-Template-OID'] = $templateOid
+
+        New-ADObject `
+            -Name $TemplateInternalName `
+            -Type 'pKICertificateTemplate' `
+            -Path (Get-CertificateTemplateContainerDn) `
+            -OtherAttributes $attributes `
+            -ErrorAction Stop
+
+        $template = Get-CertificateTemplateObject -Name $TemplateInternalName
+        if ($null -eq $template) {
+            throw "Template creation returned successfully, but '$TemplateInternalName' could not be read back from AD."
+        }
+    }
+
+    $replace = @{
+        displayName = $TemplateDisplayName
+        'msPKI-Minimal-Key-Size' = $MinimumKeySize
+        pKIDefaultKeySpec = 1
+        'msPKI-RA-Signature' = 0
+        'msPKI-Certificate-Name-Flag' = 0x18000000
+        pKIExtendedKeyUsage = '1.3.6.1.5.5.7.3.1'
+        'msPKI-Certificate-Application-Policy' = '1.3.6.1.5.5.7.3.1'
+    }
+
+    $currentEnrollmentFlag = 0
+    if ($null -ne $template.'msPKI-Enrollment-Flag') {
+        $currentEnrollmentFlag = [int]$template.'msPKI-Enrollment-Flag'
+    }
+    $replace['msPKI-Enrollment-Flag'] = ($currentEnrollmentFlag -bor 0x20)
+
+    Set-ADObject -Identity $template.DistinguishedName -Replace $replace -ErrorAction Stop
+    return Get-CertificateTemplateObject -Name $TemplateInternalName
+}
+
+function Ensure-EnrollmentGroup {
+    $escapedSam = ConvertTo-LdapFilterValue -Value $EnrollmentGroupSamAccountName
+    $escapedName = ConvertTo-LdapFilterValue -Value $EnrollmentGroupName
+
+    $matches = @(
+        Get-ADGroup `
+            -LDAPFilter "(|(sAMAccountName=$escapedSam)(cn=$escapedName)(displayName=$escapedName))" `
+            -SearchBase $domain.DistinguishedName `
+            -SearchScope Subtree `
+            -Properties SID,GroupCategory,GroupScope `
+            -ErrorAction Stop
+    )
+
+    if ($matches.Count -gt 1) {
+        throw "Multiple groups match '$EnrollmentGroupName' or '$EnrollmentGroupSamAccountName'."
+    }
+
+    if ($matches.Count -eq 0) {
+        Write-Host "Creating certificate enrollment group '$EnrollmentGroupName'..."
         New-ADGroup `
-            -Name $Name `
-            -SamAccountName $Name `
-            -DisplayName $Name `
-            -Description 'Local administrators on SharePoint servers for Ansible management' `
+            -Name $EnrollmentGroupName `
+            -SamAccountName $EnrollmentGroupSamAccountName `
+            -DisplayName $EnrollmentGroupName `
+            -Description 'SharePoint computer accounts permitted to auto-enroll for the WinRM HTTPS certificate' `
             -GroupCategory Security `
             -GroupScope Global `
-            -Path $Path `
+            -Path $EnrollmentGroupOuDn `
             -ErrorAction Stop
 
-        $group = Get-ADGroup `
-            -Identity $Name `
-            -Properties GroupCategory, GroupScope
-    }
-    else {
-        if ($group.GroupCategory -ne 'Security') {
-            throw "An object named '$Name' exists, but it is not a security group."
-        }
-
-        Write-Host "Security group already exists: $($group.DistinguishedName)"
+        $matches = @(
+            Get-ADGroup `
+                -LDAPFilter "(sAMAccountName=$escapedSam)" `
+                -SearchBase $domain.DistinguishedName `
+                -SearchScope Subtree `
+                -Properties SID,GroupCategory,GroupScope `
+                -ErrorAction Stop
+        )
     }
 
-    return $group
+    if ($matches.Count -ne 1) {
+        throw 'Enrollment group could not be resolved uniquely after creation.'
+    }
+
+    if ($matches[0].GroupCategory -ne 'Security') {
+        throw "'$($matches[0].DistinguishedName)' is not a security group."
+    }
+
+    return $matches[0]
 }
 
-function Ensure-AdServiceUser {
-    param(
-        [Parameter(Mandatory)]
-        [string]$Name,
+function Ensure-SharePointComputerMembership {
+    param([Parameter(Mandatory)]$Group)
 
-        [Parameter(Mandatory)]
-        [string]$Path,
+    $computers = @()
+    if ($SharePointComputerNames -and $SharePointComputerNames.Count -gt 0) {
+        foreach ($computerName in $SharePointComputerNames) {
+            $computers += Get-ADComputer -Identity $computerName -ErrorAction Stop
+        }
+    }
+    elseif (-not $DoNotAddAllComputersInTargetOu) {
+        $computers = @(
+            Get-ADComputer `
+                -Filter * `
+                -SearchBase $TargetOuDn `
+                -SearchScope Subtree `
+                -ErrorAction Stop
+        )
+    }
 
-        [Parameter(Mandatory)]
-        [securestring]$Password
+    if ($computers.Count -eq 0) {
+        Write-Warning 'No SharePoint computer accounts were selected for enrollment-group membership.'
+        return
+    }
+
+    $memberDns = @(
+        Get-ADGroupMember -Identity $Group.DistinguishedName -Recursive:$false -ErrorAction Stop |
+        ForEach-Object { $_.DistinguishedName }
     )
 
-    $user = Get-ADUser `
-        -LDAPFilter "(sAMAccountName=$Name)" `
-        -Properties Enabled, PasswordNeverExpires `
-        -ErrorAction SilentlyContinue
-
-    if (-not $user) {
-        Write-Host "Creating service account '$Name' in '$Path'..."
-
-        New-ADUser `
-            -Name $Name `
-            -SamAccountName $Name `
-            -UserPrincipalName "$Name@$($domain.DNSRoot)" `
-            -DisplayName $Name `
-            -Description 'Ansible service account for managing SharePoint servers' `
-            -Path $Path `
-            -AccountPassword $Password `
-            -Enabled $true `
-            -PasswordNeverExpires $true `
-            -CannotChangePassword $true `
-            -ErrorAction Stop
-
-        $user = Get-ADUser `
-            -Identity $Name `
-            -Properties Enabled, PasswordNeverExpires
-    }
-    else {
-        Write-Host "Service account already exists: $($user.DistinguishedName)"
-
-        if (-not $user.Enabled) {
-            Write-Host "Enabling service account '$Name'..."
-            Enable-ADAccount -Identity $user
+    foreach ($computer in $computers) {
+        if ($memberDns -notcontains $computer.DistinguishedName) {
+            Write-Host "Adding computer '$($computer.Name)' to '$($Group.Name)'..."
+            Add-ADGroupMember `
+                -Identity $Group.DistinguishedName `
+                -Members $computer.DistinguishedName `
+                -ErrorAction Stop
         }
-
-        if (-not $user.PasswordNeverExpires) {
-            Set-ADUser `
-                -Identity $user `
-                -PasswordNeverExpires $true
-        }
-    }
-
-    return $user
-}
-
-function Ensure-GroupMembership {
-    param(
-        [Parameter(Mandatory)]
-        $Group,
-
-        [Parameter(Mandatory)]
-        $User
-    )
-
-    $isMember = Get-ADGroupMember `
-        -Identity $Group `
-        -Recursive:$false |
-        Where-Object {
-            $_.DistinguishedName -eq $User.DistinguishedName
-        }
-
-    if (-not $isMember) {
-        Write-Host "Adding '$($User.SamAccountName)' to '$($Group.SamAccountName)'..."
-
-        Add-ADGroupMember `
-            -Identity $Group `
-            -Members $User `
-            -ErrorAction Stop
-    }
-    else {
-        Write-Host "'$($User.SamAccountName)' is already a member of '$($Group.SamAccountName)'."
     }
 }
 
-function Ensure-GpoLink {
+function Add-AdAllowRule {
     param(
-        [Parameter(Mandatory)]
-        [string]$Name,
-
-        [Parameter(Mandatory)]
-        [string]$Target
+        [Parameter(Mandatory)][System.DirectoryServices.ActiveDirectorySecurity]$Security,
+        [Parameter(Mandatory)][System.Security.Principal.SecurityIdentifier]$Sid,
+        [Parameter(Mandatory)][System.DirectoryServices.ActiveDirectoryRights]$Rights,
+        [guid]$ObjectType = [guid]::Empty
     )
 
-    $inheritance = Get-GPInheritance -Target $Target
+    $allow = [System.Security.AccessControl.AccessControlType]::Allow
+    $rule = if ($ObjectType -eq [guid]::Empty) {
+        New-Object System.DirectoryServices.ActiveDirectoryAccessRule -ArgumentList @($Sid,$Rights,$allow)
+    }
+    else {
+        New-Object System.DirectoryServices.ActiveDirectoryAccessRule -ArgumentList @($Sid,$Rights,$allow,$ObjectType)
+    }
+    [void]$Security.AddAccessRule($rule)
+}
 
-    $link = $inheritance.GpoLinks |
-        Where-Object {
-            $_.DisplayName -eq $Name
+function Ensure-TemplateAcl {
+    param(
+        [Parameter(Mandatory)]$Template,
+        [Parameter(Mandatory)]$EnrollmentGroup
+    )
+
+    $templateEntry = New-Object System.DirectoryServices.DirectoryEntry -ArgumentList "LDAP://$($Template.DistinguishedName)"
+    $security = [System.DirectoryServices.ActiveDirectorySecurity]$templateEntry.ObjectSecurity
+
+    $authenticatedUsersSid = New-Object System.Security.Principal.SecurityIdentifier -ArgumentList 'S-1-5-11'
+    $enrollGuid = [guid]'0e10c968-78fb-11d2-90d4-00c04f79dc55'
+    $autoEnrollGuid = [guid]'a05b8cc2-17bc-4802-a710-e7c15ab866a2'
+
+    Add-AdAllowRule -Security $security -Sid $authenticatedUsersSid -Rights ([System.DirectoryServices.ActiveDirectoryRights]::GenericRead)
+    Add-AdAllowRule -Security $security -Sid $EnrollmentGroup.SID -Rights ([System.DirectoryServices.ActiveDirectoryRights]::GenericRead)
+    Add-AdAllowRule -Security $security -Sid $EnrollmentGroup.SID -Rights ([System.DirectoryServices.ActiveDirectoryRights]::ExtendedRight) -ObjectType $enrollGuid
+    Add-AdAllowRule -Security $security -Sid $EnrollmentGroup.SID -Rights ([System.DirectoryServices.ActiveDirectoryRights]::ExtendedRight) -ObjectType $autoEnrollGuid
+
+    $caComputer = Get-ADComputer -Identity $env:COMPUTERNAME -Properties SID -ErrorAction Stop
+    Add-AdAllowRule -Security $security -Sid $caComputer.SID -Rights ([System.DirectoryServices.ActiveDirectoryRights]::GenericRead)
+
+    $templateEntry.ObjectSecurity = $security
+    $templateEntry.CommitChanges()
+}
+
+function Ensure-TemplatePublished {
+    $publishedNames = @(
+        Get-CATemplate -ErrorAction Stop |
+        ForEach-Object {
+            if ($_.PSObject.Properties['Name']) { [string]$_.Name }
         }
+    )
 
-    if (-not $link) {
-        Write-Host "Linking GPO '$Name' to '$Target'..."
+    if ($publishedNames -notcontains $TemplateInternalName) {
+        Add-CATemplate -Name $TemplateInternalName -Force -ErrorAction Stop
+    }
 
-        New-GPLink `
-            -Name $Name `
-            -Target $Target `
-            -LinkEnabled Yes |
-            Out-Null
+    Restart-Service -Name CertSvc -Force -ErrorAction Stop
+}
+
+function Ensure-Gpo {
+    $gpo = Get-GPO -Name $GpoName -ErrorAction SilentlyContinue
+    if ($null -eq $gpo) {
+        $gpo = New-GPO -Name $GpoName -Comment 'SharePoint WinRM HTTPS, certificate auto-enrollment, and firewall policy' -ErrorAction Stop
+    }
+
+    $inheritance = Get-GPInheritance -Target $TargetOuDn -ErrorAction Stop
+    $link = $inheritance.GpoLinks | Where-Object { $_.DisplayName -eq $GpoName } | Select-Object -First 1
+    if ($null -eq $link) {
+        New-GPLink -Name $GpoName -Target $TargetOuDn -LinkEnabled Yes -ErrorAction Stop | Out-Null
     }
     elseif (-not $link.Enabled) {
-        Write-Host "Enabling existing GPO link..."
+        Set-GPLink -Name $GpoName -Target $TargetOuDn -LinkEnabled Yes -ErrorAction Stop | Out-Null
+    }
 
-        Set-GPLink `
-            -Name $Name `
-            -Target $Target `
-            -LinkEnabled Yes |
-            Out-Null
+    return $gpo
+}
+
+function Set-GpoRegistrySettings {
+    $serviceKey = 'HKLM\SOFTWARE\Policies\Microsoft\Windows\WinRM\Service'
+    Set-GPRegistryValue -Name $GpoName -Key $serviceKey -ValueName AllowAutoConfig -Type DWord -Value 1
+    Set-GPRegistryValue -Name $GpoName -Key $serviceKey -ValueName IPv4Filter -Type String -Value $WinRmIPv4Filter
+    Set-GPRegistryValue -Name $GpoName -Key $serviceKey -ValueName IPv6Filter -Type String -Value ''
+    Set-GPRegistryValue -Name $GpoName -Key $serviceKey -ValueName AllowBasic -Type DWord -Value 0
+    Set-GPRegistryValue -Name $GpoName -Key $serviceKey -ValueName AllowUnencryptedTraffic -Type DWord -Value 0
+    Set-GPRegistryValue -Name $GpoName -Key 'HKLM\SYSTEM\CurrentControlSet\Services\WinRM' -ValueName Start -Type DWord -Value 2
+    Set-GPRegistryValue -Name $GpoName -Key 'HKLM\SOFTWARE\Policies\Microsoft\Cryptography\AutoEnrollment' -ValueName AEPolicy -Type DWord -Value 7
+
+    $firewallKey = 'HKLM\SOFTWARE\Policies\Microsoft\WindowsFirewall\FirewallRules'
+    $addresses = if ($WinRmIPv4Filter -eq '*') { '*' } else { $WinRmIPv4Filter }
+    $httpsRule = "v2.30|Action=Allow|Active=TRUE|Dir=In|Protocol=6|LPort=5986|RA4=$addresses|Profile=Domain|Name=Ansible WinRM HTTPS|Desc=Allow WinRM HTTPS from approved management addresses|"
+    Set-GPRegistryValue -Name $GpoName -Key $firewallKey -ValueName 'Ansible-WinRM-HTTPS-5986' -Type String -Value $httpsRule
+
+    if ($EnableWinRmHttp) {
+        $httpRule = "v2.30|Action=Allow|Active=TRUE|Dir=In|Protocol=6|LPort=5985|RA4=$addresses|Profile=Domain|Name=Ansible WinRM HTTP|Desc=Temporary WinRM HTTP migration rule|"
+        Set-GPRegistryValue -Name $GpoName -Key $firewallKey -ValueName 'Ansible-WinRM-HTTP-5985' -Type String -Value $httpRule
     }
     else {
-        Write-Host "GPO is already linked and enabled."
+        Remove-GPRegistryValue -Name $GpoName -Key $firewallKey -ValueName 'Ansible-WinRM-HTTP-5985' -ErrorAction SilentlyContinue
     }
 }
 
-function Set-WinRmGpoSettings {
-    param(
-        [Parameter(Mandatory)]
-        [string]$Name,
+function Set-WinRmHttpsStartupScript {
+    param([Parameter(Mandatory)]$Gpo)
 
-        [Parameter(Mandatory)]
-        [string]$IPv4Filter
-    )
-
-    Write-Host "Configuring WinRM policy settings..."
-
-    $winRmServicePolicyKey =
-        'HKLM\SOFTWARE\Policies\Microsoft\Windows\WinRM\Service'
-
-    Set-GPRegistryValue `
-        -Name $Name `
-        -Key $winRmServicePolicyKey `
-        -ValueName 'AllowAutoConfig' `
-        -Type DWord `
-        -Value 1
-
-    Set-GPRegistryValue `
-        -Name $Name `
-        -Key $winRmServicePolicyKey `
-        -ValueName 'IPv4Filter' `
-        -Type String `
-        -Value $IPv4Filter
-
-    Set-GPRegistryValue `
-        -Name $Name `
-        -Key $winRmServicePolicyKey `
-        -ValueName 'IPv6Filter' `
-        -Type String `
-        -Value ''
-
-    Set-GPRegistryValue `
-        -Name $Name `
-        -Key $winRmServicePolicyKey `
-        -ValueName 'AllowBasic' `
-        -Type DWord `
-        -Value 0
-
-    Set-GPRegistryValue `
-        -Name $Name `
-        -Key $winRmServicePolicyKey `
-        -ValueName 'AllowUnencryptedTraffic' `
-        -Type DWord `
-        -Value 0
-
-    Set-GPRegistryValue `
-        -Name $Name `
-        -Key 'HKLM\SYSTEM\CurrentControlSet\Services\WinRM' `
-        -ValueName 'Start' `
-        -Type DWord `
-        -Value 2
-}
-
-function Set-CertificateAutoEnrollmentGpoSettings {
-    param(
-        [Parameter(Mandatory)]
-        [string]$Name
-    )
-
-    Write-Host "Configuring computer certificate auto-enrollment policy..."
-
-    # AEPolicy bitmask:
-    # 1 = enroll certificates automatically
-    # 2 = renew expired certificates/update pending certificates/remove revoked
-    # 4 = update certificates that use certificate templates
-    Set-GPRegistryValue `
-        -Name $Name `
-        -Key 'HKLM\SOFTWARE\Policies\Microsoft\Cryptography\AutoEnrollment' `
-        -ValueName 'AEPolicy' `
-        -Type DWord `
-        -Value 7
-}
-
-function Set-WinRmFirewallGpoRules {
-    param(
-        [Parameter(Mandatory)]
-        [string]$Name,
-
-        [Parameter(Mandatory)]
-        [string]$RemoteAddresses,
-
-        [Parameter(Mandatory)]
-        [bool]$EnableHttp
-    )
-
-    Write-Host "Configuring WinRM firewall rules..."
-
-    $addresses = if ($RemoteAddresses -eq '*') {
-        '*'
-    }
-    else {
-        $RemoteAddresses
-    }
-
-    $firewallPolicyKey =
-        'HKLM\SOFTWARE\Policies\Microsoft\WindowsFirewall\FirewallRules'
-
-    $httpsRule = @(
-        'v2.30'
-        'Action=Allow'
-        'Active=TRUE'
-        'Dir=In'
-        'Protocol=6'
-        'LPort=5986'
-        "RA4=$addresses"
-        'Profile=Domain'
-        'Name=Ansible WinRM HTTPS'
-        'Desc=Allow WinRM HTTPS from approved Ansible management addresses'
-    ) -join '|'
-
-    $httpsRule += '|'
-
-    Set-GPRegistryValue `
-        -Name $Name `
-        -Key $firewallPolicyKey `
-        -ValueName 'Ansible-WinRM-HTTPS-5986' `
-        -Type String `
-        -Value $httpsRule
-
-    if ($EnableHttp) {
-        $httpRule = @(
-            'v2.30'
-            'Action=Allow'
-            'Active=TRUE'
-            'Dir=In'
-            'Protocol=6'
-            'LPort=5985'
-            "RA4=$addresses"
-            'Profile=Domain'
-            'Name=Ansible WinRM HTTP'
-            'Desc=Allow WinRM HTTP from approved Ansible management addresses during HTTPS migration'
-        ) -join '|'
-
-        $httpRule += '|'
-
-        Set-GPRegistryValue `
-            -Name $Name `
-            -Key $firewallPolicyKey `
-            -ValueName 'Ansible-WinRM-HTTP-5985' `
-            -Type String `
-            -Value $httpRule
-    }
-    else {
-        Remove-GPRegistryValue `
-            -Name $Name `
-            -Key $firewallPolicyKey `
-            -ValueName 'Ansible-WinRM-HTTP-5985' `
-            -ErrorAction SilentlyContinue
-    }
-}
-
-function Set-GpoWinRmHttpsStartupScript {
-    param(
-        [Parameter(Mandatory)]
-        $Gpo
-    )
-
-    Write-Host "Deploying idempotent WinRM HTTPS startup script..."
-
-    $gpoGuidText =
-        "{$($Gpo.Id.ToString().ToUpperInvariant())}"
-
-    $gpoAdPath =
-        "CN=$gpoGuidText,CN=Policies,CN=System,$($domain.DistinguishedName)"
-
-    $gpoSysvolPath = Join-Path `
-        "\\$($domain.PDCEmulator)\SYSVOL\$($domain.DNSRoot)\Policies" `
-        $gpoGuidText
-
-    $scriptsDirectory = Join-Path `
-        $gpoSysvolPath `
-        'Machine\Scripts'
-
-    $startupDirectory = Join-Path `
-        $scriptsDirectory `
-        'Startup'
-
-    $startupScriptName =
-        'Configure-WinRmHttps.ps1'
-
-    $startupScriptPath = Join-Path `
-        $startupDirectory `
-        $startupScriptName
-
-    New-Item `
-        -Path $startupDirectory `
-        -ItemType Directory `
-        -Force |
-        Out-Null
+    $gpoGuidText = "{$($Gpo.Id.ToString().ToUpperInvariant())}"
+    $gpoAdPath = "CN=$gpoGuidText,CN=Policies,CN=System,$($domain.DistinguishedName)"
+    $gpoSysvolPath = Join-Path "\\$($domain.PDCEmulator)\SYSVOL\$($domain.DNSRoot)\Policies" $gpoGuidText
+    $scriptsDirectory = Join-Path $gpoSysvolPath 'Machine\Scripts'
+    $startupDirectory = Join-Path $scriptsDirectory 'Startup'
+    $startupScriptName = 'Configure-WinRmHttps.ps1'
+    $startupScriptPath = Join-Path $startupDirectory $startupScriptName
+    New-Item -Path $startupDirectory -ItemType Directory -Force | Out-Null
 
     $startupScript = @'
 # Runs as Local System through computer startup policy.
-Set-StrictMode -Version Latest
+Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
 $logDirectory = Join-Path $env:ProgramData 'Ansible-WinRM'
@@ -439,118 +424,94 @@ New-Item -Path $logDirectory -ItemType Directory -Force | Out-Null
 
 function Write-SetupLog {
     param([Parameter(Mandatory)][string]$Message)
+    Add-Content -LiteralPath $logPath -Value ('{0:u} {1}' -f (Get-Date),$Message) -Encoding UTF8
+}
 
-    $line = '{0:u} {1}' -f (Get-Date), $Message
-    Add-Content -LiteralPath $logPath -Value $line -Encoding UTF8
+function Test-ServerAuthenticationEku {
+    param([Parameter(Mandatory)][System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate)
+
+    $eku = $Certificate.Extensions | Where-Object { $_.Oid.Value -eq '2.5.29.37' } | Select-Object -First 1
+    if ($null -eq $eku) { return $false }
+
+    try {
+        $parsed = New-Object System.Security.Cryptography.X509Certificates.X509EnhancedKeyUsageExtension -ArgumentList $eku,$eku.Critical
+        foreach ($usage in $parsed.EnhancedKeyUsages) {
+            if ([string]$usage.Value -eq '1.3.6.1.5.5.7.3.1') { return $true }
+        }
+    }
+    catch {
+        try {
+            $text = $eku.Format($false)
+            if ($text -match '1\.3\.6\.1\.5\.5\.7\.3\.1' -or $text -match 'Server Authentication') { return $true }
+        }
+        catch { }
+    }
+    return $false
+}
+
+function Get-CertificateDnsNames {
+    param([Parameter(Mandatory)][System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate)
+    $names = @()
+    try {
+        foreach ($item in @($Certificate.DnsNameList)) {
+            if ($null -ne $item -and $item.PSObject.Properties['Unicode']) {
+                $names += [string]$item.Unicode
+            }
+        }
+    }
+    catch { }
+    return @($names | ForEach-Object { $_.TrimEnd('.').ToLowerInvariant() } | Select-Object -Unique)
 }
 
 try {
     Set-Service -Name WinRM -StartupType Automatic
     Start-Service -Name WinRM
 
-    $computerSystem = Get-CimInstance -ClassName Win32_ComputerSystem
-    $fqdn = [string]$computerSystem.DNSHostName
+    $cs = Get-CimInstance Win32_ComputerSystem
+    if (-not $cs.PartOfDomain) { throw 'Computer is not domain joined.' }
+    $fqdn = ('{0}.{1}' -f $cs.DNSHostName,$cs.Domain).TrimEnd('.').ToLowerInvariant()
 
-    if ($computerSystem.PartOfDomain -and $computerSystem.Domain) {
-        $fqdn = '{0}.{1}' -f $computerSystem.DNSHostName, $computerSystem.Domain
-    }
+    & gpupdate.exe /target:computer /force | Out-Null
+    & certutil.exe -pulse | Out-Null
 
-    $fqdn = $fqdn.TrimEnd('.').ToLowerInvariant()
-
-    if (-not $fqdn) {
-        throw 'Unable to determine the computer FQDN.'
-    }
-
-    Write-SetupLog "Searching for a Server Authentication certificate for $fqdn."
-
-    $serverAuthenticationOid = '1.3.6.1.5.5.7.3.1'
     $now = Get-Date
-
-    $certificate = Get-ChildItem -Path Cert:\LocalMachine\My |
+    $certificate = Get-ChildItem Cert:\LocalMachine\My |
         Where-Object {
-            if (-not $_.HasPrivateKey -or $_.NotAfter -le $now) {
-                return $false
-            }
-
-            $hasServerAuthentication = @(
-                $_.EnhancedKeyUsageList |
-                Where-Object { $_.ObjectId.Value -eq $serverAuthenticationOid }
-            ).Count -gt 0
-
-            if (-not $hasServerAuthentication) {
-                return $false
-            }
-
-            $dnsNames = @(
-                $_.DnsNameList |
-                ForEach-Object { $_.Unicode.TrimEnd('.').ToLowerInvariant() }
-            )
-
-            $subjectCn = $null
-            if ($_.Subject -match '(?:^|,\s*)CN=([^,]+)') {
-                $subjectCn = $Matches[1].TrimEnd('.').ToLowerInvariant()
-            }
-
-            ($dnsNames -contains $fqdn) -or ($subjectCn -eq $fqdn)
+            if (-not $_.HasPrivateKey -or $_.NotBefore -gt $now -or $_.NotAfter -le $now) { return $false }
+            if (-not (Test-ServerAuthenticationEku -Certificate $_)) { return $false }
+            $dnsNames = @(Get-CertificateDnsNames -Certificate $_)
+            $subjectCn = ''
+            if ($_.Subject -match '(?:^|,\s*)CN=([^,]+)') { $subjectCn = $Matches[1].TrimEnd('.').ToLowerInvariant() }
+            return (($dnsNames -contains $fqdn) -or ($subjectCn -eq $fqdn))
         } |
-        Sort-Object -Property NotAfter -Descending |
+        Sort-Object NotAfter -Descending |
         Select-Object -First 1
 
-    if (-not $certificate) {
-        Write-SetupLog "No suitable certificate is available. Triggering auto-enrollment and leaving HTTPS unconfigured."
-        & certutil.exe -pulse | Out-Null
+    if ($null -eq $certificate) {
+        Write-SetupLog "No suitable certificate is available for $fqdn after auto-enrollment pulse."
         exit 0
     }
 
-    $thumbprint = $certificate.Thumbprint.Replace(' ', '').ToUpperInvariant()
-    Write-SetupLog "Selected certificate $thumbprint, expiring $($certificate.NotAfter.ToString('u'))."
+    $thumbprint = $certificate.Thumbprint.Replace(' ','').ToUpperInvariant()
+    Import-Module Microsoft.WSMan.Management -ErrorAction SilentlyContinue
+    $httpsListeners = @(Get-WSManInstance -ResourceURI 'winrm/config/Listener' -Enumerate -ErrorAction SilentlyContinue | Where-Object { $_.Transport -eq 'HTTPS' })
+    $matching = $httpsListeners | Where-Object {
+        ([string]$_.CertificateThumbprint).Replace(' ','').ToUpperInvariant() -eq $thumbprint -and
+        ([string]$_.Hostname).TrimEnd('.').ToLowerInvariant() -eq $fqdn
+    } | Select-Object -First 1
 
-    $httpsListeners = @(
-        Get-WSManInstance `
-            -ResourceURI 'winrm/config/Listener' `
-            -Enumerate `
-            -ErrorAction SilentlyContinue |
-        Where-Object { $_.Transport -eq 'HTTPS' }
-    )
+    if ($null -eq $matching) {
+        foreach ($listener in $httpsListeners) {
+            Remove-WSManInstance -ResourceURI 'winrm/config/Listener' -SelectorSet @{ Address=[string]$listener.Address; Transport='HTTPS' } -ErrorAction Stop
+        }
 
-    $matchingListener = $httpsListeners |
-        Where-Object {
-            $_.CertificateThumbprint.Replace(' ', '').ToUpperInvariant() -eq $thumbprint -and
-            $_.Hostname.TrimEnd('.').ToLowerInvariant() -eq $fqdn
-        } |
-        Select-Object -First 1
-
-    if ($matchingListener) {
-        Write-SetupLog 'The existing HTTPS listener already uses the desired certificate.'
-        exit 0
+        New-WSManInstance -ResourceURI 'winrm/config/Listener' -SelectorSet @{ Address='*'; Transport='HTTPS' } -ValueSet @{ Hostname=$fqdn; CertificateThumbprint=$thumbprint; Enabled=$true } -ErrorAction Stop | Out-Null
+        Restart-Service WinRM -Force
+        Write-SetupLog "Configured WinRM HTTPS for $fqdn using $thumbprint."
     }
-
-    foreach ($listener in $httpsListeners) {
-        Write-SetupLog "Removing stale HTTPS listener using certificate $($listener.CertificateThumbprint)."
-
-        Remove-WSManInstance `
-            -ResourceURI 'winrm/config/Listener' `
-            -SelectorSet @{
-                Address   = [string]$listener.Address
-                Transport = 'HTTPS'
-            }
+    else {
+        Write-SetupLog "Existing WinRM HTTPS listener already uses $thumbprint."
     }
-
-    New-WSManInstance `
-        -ResourceURI 'winrm/config/Listener' `
-        -SelectorSet @{
-            Address   = '*'
-            Transport = 'HTTPS'
-        } `
-        -ValueSet @{
-            Hostname              = $fqdn
-            CertificateThumbprint = $thumbprint
-            Enabled               = $true
-        } |
-        Out-Null
-
-    Restart-Service -Name WinRM -Force
-    Write-SetupLog "Created WinRM HTTPS listener for $fqdn on TCP 5986."
 }
 catch {
     Write-SetupLog "ERROR: $($_.Exception.Message)"
@@ -558,432 +519,105 @@ catch {
 }
 '@
 
-    Set-Content `
-        -LiteralPath $startupScriptPath `
-        -Value $startupScript `
-        -Encoding UTF8
-
-    $powerShellScriptsIniPath = Join-Path `
-        $scriptsDirectory `
-        'psscripts.ini'
-
+    Set-Content -LiteralPath $startupScriptPath -Value $startupScript -Encoding UTF8
     @"
 [Startup]
 0CmdLine=$startupScriptName
 0Parameters=-NoProfile -NonInteractive -ExecutionPolicy Bypass
-"@ | Set-Content `
-        -LiteralPath $powerShellScriptsIniPath `
-        -Encoding Unicode
+"@ | Set-Content -LiteralPath (Join-Path $scriptsDirectory 'psscripts.ini') -Encoding Unicode
 
-    # Computer-side Scripts CSE and Scripts snap-in GUID pair.
-    $scriptsCse =
-        '{42B5FAAE-6536-11D2-AE5A-0000F87571E3}'
-
-    $scriptsTool =
-        '{40B6664F-4972-11D1-A7CA-0000F87571E3}'
-
-    $extensionPair =
-        "[$scriptsCse$scriptsTool]"
-
-    $gpoAdObject = Get-ADObject `
-        -Identity $gpoAdPath `
-        -Properties gPCMachineExtensionNames, versionNumber
-
-    $extensionNames =
-        [string]$gpoAdObject.gPCMachineExtensionNames
+    $scriptsCse = '{42B5FAAE-6536-11D2-AE5A-0000F87571E3}'
+    $scriptsTool = '{40B6664F-4972-11D1-A7CA-0000F87571E3}'
+    $extensionPair = "[$scriptsCse$scriptsTool]"
+    $gpoAdObject = Get-ADObject -Identity $gpoAdPath -Properties gPCMachineExtensionNames,versionNumber -ErrorAction Stop
+    $extensionNames = [string]$gpoAdObject.gPCMachineExtensionNames
 
     if ($extensionNames -notlike "*$scriptsCse*") {
-        $pairs = @(
-            [regex]::Matches(
-                $extensionNames,
-                '\[[^\]]+\]'
-            ) |
-            ForEach-Object {
-                $_.Value
-            }
-        )
-
+        $pairs = @([regex]::Matches($extensionNames,'\[[^\]]+\]') | ForEach-Object { $_.Value })
         $pairs += $extensionPair
-
-        $extensionNames =
-            ($pairs | Sort-Object -Unique) -join ''
-
-        Set-ADObject `
-            -Identity $gpoAdPath `
-            -Replace @{
-                gPCMachineExtensionNames = $extensionNames
-            }
+        $extensionNames = ($pairs | Sort-Object -Unique) -join ''
+        Set-ADObject -Identity $gpoAdPath -Replace @{ gPCMachineExtensionNames=$extensionNames } -ErrorAction Stop
     }
 
-    # Increment the computer portion of the GPO version so clients process it.
-    $currentVersion =
-        [int64]$gpoAdObject.versionNumber
-
-    $newVersion =
-        $currentVersion + 65536
-
-    Set-ADObject `
-        -Identity $gpoAdPath `
-        -Replace @{
-            versionNumber = $newVersion
-        }
-
-    $gptIniPath = Join-Path `
-        $gpoSysvolPath `
-        'GPT.INI'
-
+    $currentVersion = [int64]$gpoAdObject.versionNumber
+    $newVersion = $currentVersion + 65536
+    Set-ADObject -Identity $gpoAdPath -Replace @{ versionNumber=$newVersion } -ErrorAction Stop
     @"
 [General]
 Version=$newVersion
-"@ | Set-Content `
-        -LiteralPath $gptIniPath `
-        -Encoding ASCII
-
-    Write-Host "Deployed startup script '$startupScriptName'."
+"@ | Set-Content -LiteralPath (Join-Path $gpoSysvolPath 'GPT.INI') -Encoding ASCII
 }
 
-function Set-GpoLocalAdministratorsMember {
+function Test-Deployment {
     param(
-        [Parameter(Mandatory)]
-        $Gpo,
-
-        [Parameter(Mandatory)]
-        $DomainGroup
+        [Parameter(Mandatory)]$Template,
+        [Parameter(Mandatory)]$Group,
+        [Parameter(Mandatory)]$Gpo
     )
 
-    Write-Host "Adding domain group to local Administrators through GPP..."
+    Write-Step 'Validation'
+    $failures = New-Object System.Collections.Generic.List[string]
 
-    $localUsersGroupsCse =
-        '{17D89FEC-5C44-4972-B12D-241CAEF74509}'
+    if ($Template.Name -ne $TemplateInternalName) { $failures.Add('Template internal name mismatch.') }
+    if ($Template.DisplayName -ne $TemplateDisplayName) { $failures.Add('Template display name mismatch.') }
 
-    $localUsersGroupsTool =
-        '{79F92669-4224-476C-9C5C-6EFB4D87DF4A}'
+    $published = @(Get-CATemplate | ForEach-Object { if ($_.PSObject.Properties['Name']) { [string]$_.Name } })
+    if ($published -notcontains $TemplateInternalName) { $failures.Add('Template is not published on the CA.') }
 
-    $extensionPair =
-        "[$localUsersGroupsCse$localUsersGroupsTool]"
-
-    $gpoGuidText =
-        "{$($Gpo.Id.ToString().ToUpperInvariant())}"
-
-    $gpoAdPath =
-        "CN=$gpoGuidText,CN=Policies,CN=System,$($domain.DistinguishedName)"
-
-    $gpoSysvolPath = Join-Path `
-        "\\$($domain.PDCEmulator)\SYSVOL\$($domain.DNSRoot)\Policies" `
-        $gpoGuidText
-
-    $groupsDirectory = Join-Path `
-        $gpoSysvolPath `
-        'Machine\Preferences\Groups'
-
-    $groupsXmlPath = Join-Path `
-        $groupsDirectory `
-        'Groups.xml'
-
-    New-Item `
-        -Path $groupsDirectory `
-        -ItemType Directory `
-        -Force |
-        Out-Null
-
-    if (Test-Path $groupsXmlPath) {
-        [xml]$xml = Get-Content `
-            -LiteralPath $groupsXmlPath `
-            -Raw
-    }
-    else {
-        $xml = New-Object System.Xml.XmlDocument
-
-        $declaration = $xml.CreateXmlDeclaration(
-            '1.0',
-            'utf-8',
-            $null
-        )
-
-        [void]$xml.AppendChild($declaration)
-
-        $root = $xml.CreateElement('Groups')
-
-        $root.SetAttribute(
-            'clsid',
-            '{3125E937-EB16-4B4C-9934-544FC6D24D26}'
-        )
-
-        [void]$xml.AppendChild($root)
-    }
-
-    $groupSid =
-        $DomainGroup.SID.Value
-
-    $domainGroupName =
-        "$($domain.NetBIOSName)\$($DomainGroup.SamAccountName)"
-
-    # Stable GUID so rerunning updates the same preference item.
-    $preferenceUid =
-        '{A48750E4-81AB-4BB9-ADBA-3FCF528A19AE}'
-
-    $existingItem = $xml.SelectSingleNode(
-        "/Groups/Group[@uid='$preferenceUid']"
-    )
-
-    if (-not $existingItem) {
-        $existingItem = $xml.CreateElement('Group')
-        [void]$xml.DocumentElement.AppendChild($existingItem)
-    }
-    else {
-        $existingItem.RemoveAll()
-    }
-
-    $existingItem.SetAttribute(
-        'clsid',
-        '{6D4A79E4-529C-4481-ABD0-F5BD7EA93BA7}'
-    )
-
-    $existingItem.SetAttribute(
-        'name',
-        'Administrators (built-in)'
-    )
-
-    $existingItem.SetAttribute('image', '2')
-
-    $existingItem.SetAttribute(
-        'changed',
-        (Get-Date).ToUniversalTime().ToString(
-            'yyyy-MM-dd HH:mm:ss'
-        )
-    )
-
-    $existingItem.SetAttribute(
-        'uid',
-        $preferenceUid
-    )
-
-    $existingItem.SetAttribute(
-        'userContext',
-        '0'
-    )
-
-    $existingItem.SetAttribute(
-        'removePolicy',
-        '0'
-    )
-
-    $properties = $xml.CreateElement('Properties')
-
-    # U = Update, preserving existing local Administrators members.
-    $properties.SetAttribute('action', 'U')
-    $properties.SetAttribute('newName', '')
-
-    $properties.SetAttribute(
-        'description',
-        'Add Ansible SharePoint administrators without replacing existing members'
-    )
-
-    $properties.SetAttribute(
-        'deleteAllUsers',
-        '0'
-    )
-
-    $properties.SetAttribute(
-        'deleteAllGroups',
-        '0'
-    )
-
-    $properties.SetAttribute(
-        'removeAccounts',
-        '0'
-    )
-
-    $properties.SetAttribute(
-        'groupName',
-        'Administrators'
-    )
-
-    [void]$existingItem.AppendChild($properties)
-
-    $members = $xml.CreateElement('Members')
-    [void]$properties.AppendChild($members)
-
-    $member = $xml.CreateElement('Member')
-
-    $member.SetAttribute(
-        'name',
-        $domainGroupName
-    )
-
-    $member.SetAttribute(
-        'action',
-        'ADD'
-    )
-
-    $member.SetAttribute(
-        'sid',
-        $groupSid
-    )
-
-    [void]$members.AppendChild($member)
-
-    $xmlWriterSettings =
-        New-Object System.Xml.XmlWriterSettings
-
-    $xmlWriterSettings.Indent = $true
-
-    $xmlWriterSettings.Encoding =
-        New-Object System.Text.UTF8Encoding($false)
-
-    $writer = [System.Xml.XmlWriter]::Create(
-        $groupsXmlPath,
-        $xmlWriterSettings
-    )
-
-    try {
-        $xml.Save($writer)
-    }
-    finally {
-        $writer.Dispose()
-    }
-
-    $gpoAdObject = Get-ADObject `
-        -Identity $gpoAdPath `
-        -Properties gPCMachineExtensionNames, versionNumber
-
-    $extensionNames =
-        [string]$gpoAdObject.gPCMachineExtensionNames
-
-    if ($extensionNames -notlike "*$localUsersGroupsCse*") {
-        $pairs = @(
-            [regex]::Matches(
-                $extensionNames,
-                '\[[^\]]+\]'
-            ) |
-            ForEach-Object {
-                $_.Value
+    $members = @(Get-ADGroupMember -Identity $Group.DistinguishedName -Recursive:$false)
+    if (-not $DoNotAddAllComputersInTargetOu -and -not $SharePointComputerNames) {
+        $expected = @(Get-ADComputer -Filter * -SearchBase $TargetOuDn -SearchScope Subtree)
+        foreach ($computer in $expected) {
+            if ($members.DistinguishedName -notcontains $computer.DistinguishedName) {
+                $failures.Add("Computer '$($computer.Name)' is not in the enrollment group.")
             }
-        )
-
-        $pairs += $extensionPair
-
-        $extensionNames =
-            ($pairs | Sort-Object -Unique) -join ''
-
-        Set-ADObject `
-            -Identity $gpoAdPath `
-            -Replace @{
-                gPCMachineExtensionNames = $extensionNames
-            }
-    }
-
-    # Increment the computer portion of the GPO version.
-    $currentVersion =
-        [int64]$gpoAdObject.versionNumber
-
-    $newVersion =
-        $currentVersion + 65536
-
-    Set-ADObject `
-        -Identity $gpoAdPath `
-        -Replace @{
-            versionNumber = $newVersion
         }
+    }
 
-    $gptIniPath = Join-Path `
-        $gpoSysvolPath `
-        'GPT.INI'
+    $gpoCheck = Get-GPO -Guid $Gpo.Id -ErrorAction SilentlyContinue
+    if ($null -eq $gpoCheck) { $failures.Add('GPO could not be read back.') }
 
-    @"
-[General]
-Version=$newVersion
-"@ | Set-Content `
-        -LiteralPath $gptIniPath `
-        -Encoding ASCII
+    if ($failures.Count -gt 0) {
+        foreach ($failure in $failures) { Write-Host "[FAIL] $failure" -ForegroundColor Red }
+        throw "Deployment validation failed with $($failures.Count) issue(s)."
+    }
 
-    Write-Host `
-        "Configured '$domainGroupName' as a local Administrators member."
+    Write-Host '[PASS] Template, publication, enrollment group, membership, and GPO validated.' -ForegroundColor Green
 }
 
-# -------------------------------------------------------------------------
-# Validate AD paths and GPO
-# -------------------------------------------------------------------------
+Write-Step 'Preflight'
+Assert-AdObjectExists -DistinguishedName $TargetOuDn
+Assert-AdObjectExists -DistinguishedName $EnrollmentGroupOuDn
 
-Assert-AdContainer `
-    -DistinguishedName $TargetOuDn
+$certSvc = Get-Service -Name CertSvc -ErrorAction Stop
+Write-Host "CA server: $env:COMPUTERNAME"
+Write-Host "CertSvc:   $($certSvc.Status)"
+Write-Host "Target OU: $TargetOuDn"
 
-Assert-AdContainer `
-    -DistinguishedName $ServiceAccountsOuDn
+Write-Step 'Enrollment security group and SharePoint computers'
+$enrollmentGroup = Ensure-EnrollmentGroup
+Ensure-SharePointComputerMembership -Group $enrollmentGroup
 
-$gpo = Get-GPO `
-    -Name $GpoName `
-    -ErrorAction Stop
+Write-Step 'Certificate template'
+$template = Ensure-CertificateTemplate
+Ensure-TemplateAcl -Template $template -EnrollmentGroup $enrollmentGroup
+Ensure-TemplatePublished
+$template = Get-CertificateTemplateObject -Name $TemplateInternalName
 
-Write-Host ''
-Write-Host "Domain:             $($domain.DNSRoot)"
-Write-Host "SharePoint server OU:      $TargetOuDn"
-Write-Host "Service account OU: $ServiceAccountsOuDn"
-Write-Host "GPO:                $GpoName"
-Write-Host ''
+Write-Step 'Group Policy'
+$gpo = Ensure-Gpo
+Set-GpoRegistrySettings
+Set-WinRmHttpsStartupScript -Gpo $gpo
 
-# -------------------------------------------------------------------------
-# Create the group and user in the Service Accounts OU
-# -------------------------------------------------------------------------
-
-$adminGroup = Ensure-AdSecurityGroup `
-    -Name $AdminGroupName `
-    -Path $ServiceAccountsOuDn
-
-$serviceUser = Ensure-AdServiceUser `
-    -Name $ServiceAccountName `
-    -Path $ServiceAccountsOuDn `
-    -Password $AccountPassword
-
-Ensure-GroupMembership `
-    -Group $adminGroup `
-    -User $serviceUser
-
-# -------------------------------------------------------------------------
-# Ensure the GPO is linked to the SharePoint server OU
-# -------------------------------------------------------------------------
-
-Ensure-GpoLink `
-    -Name $GpoName `
-    -Target $TargetOuDn
-
-# -------------------------------------------------------------------------
-# Configure WinRM and firewall
-# -------------------------------------------------------------------------
-
-Set-WinRmGpoSettings `
-    -Name $GpoName `
-    -IPv4Filter $WinRmIPv4Filter
-
-if ($EnableCertificateAutoEnrollment) {
-    Set-CertificateAutoEnrollmentGpoSettings `
-        -Name $GpoName
-}
-
-Set-WinRmFirewallGpoRules `
-    -Name $GpoName `
-    -RemoteAddresses $WinRmIPv4Filter `
-    -EnableHttp $EnableWinRmHttp
-
-Set-GpoWinRmHttpsStartupScript `
-    -Gpo $gpo
-
-# -------------------------------------------------------------------------
-# Add the domain group to local Administrators on SharePoint servers
-# -------------------------------------------------------------------------
-
-Set-GpoLocalAdministratorsMember `
-    -Gpo $gpo `
-    -DomainGroup $adminGroup
+Test-Deployment -Template $template -Group $enrollmentGroup -Gpo $gpo
 
 Write-Host ''
-Write-Host 'Configuration complete.' -ForegroundColor Green
-Write-Host "Service account: $($domain.NetBIOSName)\$ServiceAccountName"
-Write-Host "Security group:  $($domain.NetBIOSName)\$AdminGroupName"
-Write-Host "Objects OU:      $ServiceAccountsOuDn"
-Write-Host "Servers OU:      $TargetOuDn"
-Write-Host "GPO:             $GpoName"
-Write-Host "WinRM HTTPS:     Enabled through startup script and TCP 5986 firewall rule"
-Write-Host "WinRM HTTP:      $EnableWinRmHttp"
-Write-Host "Certificate AE:  $EnableCertificateAutoEnrollment"
+Write-Host 'Deployment completed successfully.' -ForegroundColor Green
+Write-Host "Template:         $TemplateDisplayName ($TemplateInternalName)"
+Write-Host "Enrollment group: $($enrollmentGroup.SamAccountName)"
+Write-Host "GPO:              $GpoName"
+Write-Host ''
+Write-Host 'Restart the SharePoint nodes (required for new computer-group membership tokens), then run:' -ForegroundColor Yellow
+Write-Host '  gpupdate.exe /force'
+Write-Host '  certutil.exe -pulse'
 Write-Host ''
