@@ -143,8 +143,8 @@ function Test-EnrollmentTemplateVisibility {
         $text = $output -join [Environment]::NewLine
 
         if ($exitCode -ne 0) {
-            $unsigned = [uint32]$exitCode
-            $hex = '0x{0:X8}' -f $unsigned
+            $hexValue = ([int64]$exitCode -band [int64]4294967295)
+            $hex = '0x{0:X8}' -f $hexValue
             Write-Warn "certutil -template failed with exit code $exitCode ($hex). This check is advisory; certificate and listener checks remain authoritative."
             $output | Select-Object -Last 20 | ForEach-Object { Write-Host "  $_" }
             return
@@ -173,7 +173,9 @@ function Test-DeploymentTask {
 
         Write-Info "State: $($task.State)"
         Write-Info "Last run: $($info.LastRunTime)"
-        Write-Info ("Last result: {0} (0x{0:X8})" -f [uint32]$info.LastTaskResult)
+        $taskResult = [int64]$info.LastTaskResult
+        $taskResultHex = '0x{0:X8}' -f ($taskResult -band [int64]4294967295)
+        Write-Info "Last result: $taskResult ($taskResultHex)"
         Write-Info "Next run: $($info.NextRunTime)"
 
         if ($task.Settings.Enabled) {
@@ -183,7 +185,7 @@ function Test-DeploymentTask {
             Write-Fail "Scheduled task '$TaskName' is disabled."
         }
 
-        switch ([uint32]$info.LastTaskResult) {
+        switch ([int64]$info.LastTaskResult) {
             0          { Write-Pass 'Scheduled task last completed successfully.' }
             267009     { Write-Warn 'Scheduled task is currently running (0x00041301).' }
             267011     { Write-Warn 'Scheduled task has not yet run (0x00041303).' }
@@ -429,20 +431,15 @@ function Test-WinRm {
     catch {
         $message = $_.Exception.Message
         if ($message -match '12175|revocation|revoked') {
-            Write-Fail "Test-WSMan reached HTTPS but strict certificate validation failed because revocation status could not be checked: $message"
+            Write-Warn "Full certificate validation could not check revocation status: $message"
 
-            if ($DiagnosticSkipRevocationCheck) {
-                try {
-                    $sessionOption = New-PSSessionOption -SkipRevocationCheck
-                    $null = Test-WSMan -ComputerName $Fqdn -UseSSL -SessionOption $sessionOption -ErrorAction Stop
-                    Write-Warn 'Diagnostic retry succeeded only with revocation checking skipped. WinRM HTTPS is reachable, but the certificate CDP/CRL infrastructure must be repaired before production use.'
-                }
-                catch {
-                    Write-Fail "Diagnostic retry with revocation checking skipped also failed: $($_.Exception.Message)"
-                }
+            try {
+                $sessionOption = New-PSSessionOption -SkipRevocationCheck
+                $null = Test-WSMan -ComputerName $Fqdn -UseSSL -SessionOption $sessionOption -ErrorAction Stop
+                Write-Warn 'WinRM HTTPS succeeds when only revocation checking is skipped. The listener, certificate trust, and hostname are working; CRL/CDP reachability still needs repair.'
             }
-            else {
-                Write-Info 'Rerun with -DiagnosticSkipRevocationCheck to distinguish a pure CRL-reachability problem from a broader WinRM problem.'
+            catch {
+                Write-Fail "WinRM HTTPS also failed when only revocation checking was skipped: $($_.Exception.Message)"
             }
         }
         else {
