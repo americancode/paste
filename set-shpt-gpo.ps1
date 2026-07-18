@@ -15,6 +15,7 @@ param(
     [ValidateRange(2048,16384)]
     [int]$MinimumKeySize = 2048,
     [string]$WinRmIPv4Filter = '*',
+    [string]$WinRmHttpsFirewallRuleName = 'Ansible WinRM HTTPS 5986',
     [bool]$EnableWinRmHttp = $true,
     [switch]$DoNotAddAllComputersInTargetOu,
     [string[]]$SharePointComputerNames,
@@ -417,7 +418,7 @@ function Set-WinRmHttpsStartupScript {
 
     # This startup script does only fast local work. It never calls gpupdate,
     # waits for certificate enrollment, or modifies WSMan during GP processing.
-    $startupScript = @'
+    $startupScript = @"
 # Runs as Local System through computer startup policy.
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
@@ -426,6 +427,8 @@ $root = Join-Path $env:ProgramData 'Ansible-WinRM'
 $workerPath = Join-Path $root 'Configure-WinRmHttps.ps1'
 $bootstrapLog = Join-Path $root 'Install-WinRmHttpsTask.log'
 $taskName = 'Configure Ansible WinRM HTTPS'
+$firewallRuleName = '$WinRmHttpsFirewallRuleName'
+$firewallRemoteAddresses = '$WinRmIPv4Filter'
 New-Item -Path $root -ItemType Directory -Force | Out-Null
 
 function Write-BootstrapLog {
@@ -501,6 +504,61 @@ try {
     `$cs = Get-CimInstance Win32_ComputerSystem
     if (-not `$cs.PartOfDomain) { throw 'Computer is not domain joined.' }
     `$fqdn = ('{0}.{1}' -f `$cs.DNSHostName,`$cs.Domain).TrimEnd('.').ToLowerInvariant()
+
+    # Ensure the local firewall permits WinRM HTTPS. This is intentionally
+    # idempotent and repairs an existing rule if its settings drift.
+    `$desiredRemoteAddresses = if (
+        [string]::IsNullOrWhiteSpace(`$firewallRemoteAddresses) -or
+        `$firewallRemoteAddresses -eq '*'
+    ) {
+        @('Any')
+    }
+    else {
+        @(`$firewallRemoteAddresses -split '[,;]' |
+            ForEach-Object { `$_.Trim() } |
+            Where-Object { -not [string]::IsNullOrWhiteSpace(`$_) })
+    }
+
+    `$firewallRule = Get-NetFirewallRule `
+        -DisplayName `$firewallRuleName `
+        -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+
+    if (`$null -eq `$firewallRule) {
+        New-NetFirewallRule `
+            -DisplayName `$firewallRuleName `
+            -Description 'Allow Ansible/AWX WinRM over HTTPS' `
+            -Direction Inbound `
+            -Action Allow `
+            -Enabled True `
+            -Profile Any `
+            -Protocol TCP `
+            -LocalPort 5986 `
+            -RemoteAddress `$desiredRemoteAddresses `
+            -ErrorAction Stop | Out-Null
+
+        Write-SetupLog "Created firewall rule '`$firewallRuleName' for TCP 5986."
+    }
+    else {
+        Set-NetFirewallRule `
+            -InputObject `$firewallRule `
+            -Direction Inbound `
+            -Action Allow `
+            -Enabled True `
+            -Profile Any `
+            -ErrorAction Stop | Out-Null
+
+        `$firewallRule | Set-NetFirewallPortFilter `
+            -Protocol TCP `
+            -LocalPort 5986 `
+            -ErrorAction Stop | Out-Null
+
+        `$firewallRule | Set-NetFirewallAddressFilter `
+            -RemoteAddress `$desiredRemoteAddresses `
+            -ErrorAction Stop | Out-Null
+
+        Write-SetupLog "Verified firewall rule '`$firewallRuleName' for TCP 5986."
+    }
 
     # Never run gpupdate here. This task is started by Group Policy.
     & certutil.exe -pulse | Out-Null
@@ -581,7 +639,7 @@ catch {
 
 # Always return successfully so startup policy cannot hold the boot sequence.
 exit 0
-'@
+"@
 
     Set-Content -LiteralPath $startupScriptPath -Value $startupScript -Encoding UTF8
     @"
@@ -641,6 +699,15 @@ function Test-Deployment {
     $gpoCheck = Get-GPO -Guid $Gpo.Id -ErrorAction SilentlyContinue
     if ($null -eq $gpoCheck) { $failures.Add('GPO could not be read back.') }
 
+    $firewallPolicy = Get-GPRegistryValue `
+        -Name $GpoName `
+        -Key 'HKLM\SOFTWARE\Policies\Microsoft\WindowsFirewall\FirewallRules' `
+        -ValueName 'Ansible-WinRM-HTTPS-5986' `
+        -ErrorAction SilentlyContinue
+    if ($null -eq $firewallPolicy -or [string]$firewallPolicy.Value -notmatch 'LPort=5986') {
+        $failures.Add('GPO firewall policy for TCP 5986 is missing or invalid.')
+    }
+
     if ($failures.Count -gt 0) {
         foreach ($failure in $failures) { Write-Host "[FAIL] $failure" -ForegroundColor Red }
         throw "Deployment validation failed with $($failures.Count) issue(s)."
@@ -680,6 +747,7 @@ Write-Host 'Deployment completed successfully.' -ForegroundColor Green
 Write-Host "Template:         $TemplateDisplayName ($TemplateInternalName)"
 Write-Host "Enrollment group: $($enrollmentGroup.SamAccountName)"
 Write-Host "GPO:              $GpoName"
+Write-Host "Firewall rule:    $WinRmHttpsFirewallRuleName (TCP 5986, profile Any)"
 Write-Host ''
 if ($EnableGpoLink) {
     Write-Host 'The GPO link is enabled. Restart one SharePoint node first and verify it boots normally.' -ForegroundColor Yellow
