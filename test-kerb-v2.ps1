@@ -435,8 +435,23 @@ function Test-WinRm {
 
             try {
                 $sessionOption = New-PSSessionOption -SkipRevocationCheck
-                $null = Test-WSMan -ComputerName $Fqdn -UseSSL -SessionOption $sessionOption -ErrorAction Stop
-                Write-Warn 'WinRM HTTPS succeeds when only revocation checking is skipped. The listener, certificate trust, and hostname are working; CRL/CDP reachability still needs repair.'
+                $session = $null
+
+                try {
+                    $session = New-PSSession `
+                        -ComputerName $Fqdn `
+                        -UseSSL `
+                        -Authentication Negotiate `
+                        -SessionOption $sessionOption `
+                        -ErrorAction Stop
+
+                    Write-Warn 'WinRM HTTPS succeeds when only revocation checking is skipped. The listener, certificate trust, hostname, authentication, and remoting endpoint are working; CRL/CDP reachability still needs repair.'
+                }
+                finally {
+                    if ($null -ne $session) {
+                        Remove-PSSession -Session $session -ErrorAction SilentlyContinue
+                    }
+                }
             }
             catch {
                 Write-Fail "WinRM HTTPS also failed when only revocation checking was skipped: $($_.Exception.Message)"
