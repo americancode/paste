@@ -418,7 +418,7 @@ function Set-WinRmHttpsStartupScript {
 
     # This startup script does only fast local work. It never calls gpupdate,
     # waits for certificate enrollment, or modifies WSMan during GP processing.
-    $startupScript = @"
+    $startupScript = @'
 # Runs as Local System through computer startup policy.
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
@@ -427,8 +427,8 @@ $root = Join-Path $env:ProgramData 'Ansible-WinRM'
 $workerPath = Join-Path $root 'Configure-WinRmHttps.ps1'
 $bootstrapLog = Join-Path $root 'Install-WinRmHttpsTask.log'
 $taskName = 'Configure Ansible WinRM HTTPS'
-$firewallRuleName = '$WinRmHttpsFirewallRuleName'
-$firewallRemoteAddresses = '$WinRmIPv4Filter'
+$firewallRuleName = '__WINRM_FIREWALL_RULE_NAME__'
+$firewallRemoteAddresses = '__WINRM_FIREWALL_REMOTE_ADDRESSES__'
 New-Item -Path $root -ItemType Directory -Force | Out-Null
 
 function Write-BootstrapLog {
@@ -505,8 +505,7 @@ try {
     if (-not `$cs.PartOfDomain) { throw 'Computer is not domain joined.' }
     `$fqdn = ('{0}.{1}' -f `$cs.DNSHostName,`$cs.Domain).TrimEnd('.').ToLowerInvariant()
 
-    # Ensure the local firewall permits WinRM HTTPS. This is intentionally
-    # idempotent and repairs an existing rule if its settings drift.
+    # Ensure an effective local inbound firewall rule exists for WinRM HTTPS.
     `$desiredRemoteAddresses = if (
         [string]::IsNullOrWhiteSpace(`$firewallRemoteAddresses) -or
         `$firewallRemoteAddresses -eq '*'
@@ -514,17 +513,23 @@ try {
         @('Any')
     }
     else {
-        @(`$firewallRemoteAddresses -split '[,;]' |
-            ForEach-Object { `$_.Trim() } |
-            Where-Object { -not [string]::IsNullOrWhiteSpace(`$_) })
+        @(
+            `$firewallRemoteAddresses -split '[,;]' |
+                ForEach-Object { `$_.Trim() } |
+                Where-Object { -not [string]::IsNullOrWhiteSpace(`$_) }
+        )
     }
 
-    `$firewallRule = Get-NetFirewallRule `
-        -DisplayName `$firewallRuleName `
-        -ErrorAction SilentlyContinue |
-        Select-Object -First 1
+    `$existingFirewallRules = @(
+        Get-NetFirewallRule -DisplayName `$firewallRuleName -ErrorAction SilentlyContinue
+    )
 
-    if (`$null -eq `$firewallRule) {
+    if (`$existingFirewallRules.Count -gt 1) {
+        `$existingFirewallRules | Select-Object -Skip 1 | Remove-NetFirewallRule -ErrorAction Stop
+        `$existingFirewallRules = @(`$existingFirewallRules | Select-Object -First 1)
+    }
+
+    if (`$existingFirewallRules.Count -eq 0) {
         New-NetFirewallRule `
             -DisplayName `$firewallRuleName `
             -Description 'Allow Ansible/AWX WinRM over HTTPS' `
@@ -540,6 +545,8 @@ try {
         Write-SetupLog "Created firewall rule '`$firewallRuleName' for TCP 5986."
     }
     else {
+        `$firewallRule = `$existingFirewallRules[0]
+
         Set-NetFirewallRule `
             -InputObject `$firewallRule `
             -Direction Inbound `
@@ -639,7 +646,13 @@ catch {
 
 # Always return successfully so startup policy cannot hold the boot sequence.
 exit 0
-"@
+'@
+
+    $escapedFirewallRuleName = $WinRmHttpsFirewallRuleName.Replace("'", "''")
+    $escapedFirewallRemoteAddresses = $WinRmIPv4Filter.Replace("'", "''")
+    $startupScript = $startupScript.
+        Replace('__WINRM_FIREWALL_RULE_NAME__', $escapedFirewallRuleName).
+        Replace('__WINRM_FIREWALL_REMOTE_ADDRESSES__', $escapedFirewallRemoteAddresses)
 
     Set-Content -LiteralPath $startupScriptPath -Value $startupScript -Encoding UTF8
     @"
@@ -704,6 +717,7 @@ function Test-Deployment {
         -Key 'HKLM\SOFTWARE\Policies\Microsoft\WindowsFirewall\FirewallRules' `
         -ValueName 'Ansible-WinRM-HTTPS-5986' `
         -ErrorAction SilentlyContinue
+
     if ($null -eq $firewallPolicy -or [string]$firewallPolicy.Value -notmatch 'LPort=5986') {
         $failures.Add('GPO firewall policy for TCP 5986 is missing or invalid.')
     }
