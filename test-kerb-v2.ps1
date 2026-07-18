@@ -25,7 +25,8 @@ param(
     [string]$InstallLogPath = 'C:\ProgramData\Ansible-WinRM\Install-WinRmHttpsTask.log',
     [string]$ConfigureLogPath = 'C:\ProgramData\Ansible-WinRM\Configure-WinRmHttps.log',
     [ValidateRange(1, 500)]
-    [int]$LogTail = 80
+    [int]$LogTail = 80,
+    [switch]$DiagnosticSkipRevocationCheck
 )
 
 Set-StrictMode -Version 2.0
@@ -142,7 +143,9 @@ function Test-EnrollmentTemplateVisibility {
         $text = $output -join [Environment]::NewLine
 
         if ($exitCode -ne 0) {
-            Write-Fail "certutil -template failed with exit code $exitCode."
+            $unsigned = [uint32]$exitCode
+            $hex = '0x{0:X8}' -f $unsigned
+            Write-Warn "certutil -template failed with exit code $exitCode ($hex). This check is advisory; certificate and listener checks remain authoritative."
             $output | Select-Object -Last 20 | ForEach-Object { Write-Host "  $_" }
             return
         }
@@ -354,17 +357,40 @@ function Test-WinRm {
         else {
             Write-Pass "$($https.Count) WinRM HTTPS listener(s) found."
             foreach ($listener in $https) {
-                $listenerHost = ([string]$listener.Hostname).TrimEnd('.').ToLowerInvariant()
-                $thumb = ([string]$listener.CertificateThumbprint).Replace(' ', '').ToUpperInvariant()
+                $hostProperty = $listener.PSObject.Properties['Hostname']
+                $thumbProperty = $listener.PSObject.Properties['CertificateThumbprint']
+
+                $listenerHost = if ($null -ne $hostProperty) {
+                    ([string]$hostProperty.Value).TrimEnd('.').ToLowerInvariant()
+                }
+                else { '' }
+
+                $thumb = if ($null -ne $thumbProperty) {
+                    ([string]$thumbProperty.Value).Replace(' ', '').ToUpperInvariant()
+                }
+                else { '' }
 
                 if ($listenerHost -eq $Fqdn) { Write-Pass "Listener hostname matches $Fqdn." }
                 else { Write-Fail "Listener hostname '$listenerHost' does not match '$Fqdn'." }
+
+                if ([string]::IsNullOrWhiteSpace($thumb)) {
+                    Write-Fail 'HTTPS listener did not expose a CertificateThumbprint property.'
+                    continue
+                }
 
                 $cert = Get-Item -LiteralPath "Cert:\LocalMachine\My\$thumb" -ErrorAction SilentlyContinue
                 if ($null -ne $cert) { Write-Pass "Listener certificate $thumb exists." }
                 else { Write-Fail "Listener certificate $thumb is missing." }
 
-                $suitableThumbs = @($SuitableCertificates | ForEach-Object { $_.Thumbprint.Replace(' ', '').ToUpperInvariant() })
+                $suitableThumbs = @(
+                    $SuitableCertificates |
+                    ForEach-Object {
+                        $property = $_.PSObject.Properties['Thumbprint']
+                        if ($null -ne $property -and -not [string]::IsNullOrWhiteSpace([string]$property.Value)) {
+                            ([string]$property.Value).Replace(' ', '').ToUpperInvariant()
+                        }
+                    }
+                )
                 if ($suitableThumbs -contains $thumb) {
                     Write-Pass 'Listener uses a certificate that passed all suitability checks.'
                 }
@@ -398,10 +424,30 @@ function Test-WinRm {
 
     try {
         $null = Test-WSMan -ComputerName $Fqdn -UseSSL -ErrorAction Stop
-        Write-Pass "Test-WSMan over HTTPS succeeded for $Fqdn."
+        Write-Pass "Test-WSMan over HTTPS succeeded for $Fqdn with full certificate validation."
     }
     catch {
-        Write-Fail "Test-WSMan over HTTPS failed: $($_.Exception.Message)"
+        $message = $_.Exception.Message
+        if ($message -match '12175|revocation|revoked') {
+            Write-Fail "Test-WSMan reached HTTPS but strict certificate validation failed because revocation status could not be checked: $message"
+
+            if ($DiagnosticSkipRevocationCheck) {
+                try {
+                    $sessionOption = New-PSSessionOption -SkipRevocationCheck
+                    $null = Test-WSMan -ComputerName $Fqdn -UseSSL -SessionOption $sessionOption -ErrorAction Stop
+                    Write-Warn 'Diagnostic retry succeeded only with revocation checking skipped. WinRM HTTPS is reachable, but the certificate CDP/CRL infrastructure must be repaired before production use.'
+                }
+                catch {
+                    Write-Fail "Diagnostic retry with revocation checking skipped also failed: $($_.Exception.Message)"
+                }
+            }
+            else {
+                Write-Info 'Rerun with -DiagnosticSkipRevocationCheck to distinguish a pure CRL-reachability problem from a broader WinRM problem.'
+            }
+        }
+        else {
+            Write-Fail "Test-WSMan over HTTPS failed: $message"
+        }
     }
 }
 

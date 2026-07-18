@@ -520,8 +520,17 @@ try {
     Import-Module Microsoft.WSMan.Management -ErrorAction SilentlyContinue
     `$httpsListeners = @(Get-WSManInstance -ResourceURI 'winrm/config/Listener' -Enumerate -ErrorAction SilentlyContinue | Where-Object { [string]`$_.Transport -eq 'HTTPS' })
     `$matching = `$httpsListeners | Where-Object {
-        ([string]`$_.CertificateThumbprint).Replace(' ','').ToUpperInvariant() -eq `$thumbprint -and
-        ([string]`$_.Hostname).TrimEnd('.').ToLowerInvariant() -eq `$fqdn
+        `$thumbProperty = `$_.PSObject.Properties['CertificateThumbprint']
+        `$hostProperty = `$_.PSObject.Properties['Hostname']
+        `$existingThumbprint = if (`$null -ne `$thumbProperty) {
+            ([string]`$thumbProperty.Value).Replace(' ','').ToUpperInvariant()
+        }
+        else { '' }
+        `$existingHostname = if (`$null -ne `$hostProperty) {
+            ([string]`$hostProperty.Value).TrimEnd('.').ToLowerInvariant()
+        }
+        else { '' }
+        `$existingThumbprint -eq `$thumbprint -and `$existingHostname -eq `$fqdn
     } | Select-Object -First 1
 
     if (`$null -eq `$matching) {
@@ -680,8 +689,3 @@ else {
 }
 Write-Host 'Node configuration runs asynchronously through the scheduled task: Configure Ansible WinRM HTTPS'
 Write-Host ''
-
-.\Deploy-SharePoint-WinRM-HTTPS-Holistic-v2.ps1 `
-    -TargetOuDn "OU=Sharepoint,OU=Servers,DC=contoso,DC=com" `
-    -WinRmIPv4Filter "*" `
-    -EnableGpoLink
