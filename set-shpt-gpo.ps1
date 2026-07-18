@@ -17,7 +17,8 @@ param(
     [string]$WinRmIPv4Filter = '*',
     [bool]$EnableWinRmHttp = $true,
     [switch]$DoNotAddAllComputersInTargetOu,
-    [string[]]$SharePointComputerNames
+    [string[]]$SharePointComputerNames,
+    [switch]$EnableGpoLink
 )
 
 Set-StrictMode -Version 2.0
@@ -368,9 +369,10 @@ function Ensure-Gpo {
     $inheritance = Get-GPInheritance -Target $TargetOuDn -ErrorAction Stop
     $link = $inheritance.GpoLinks | Where-Object { $_.DisplayName -eq $GpoName } | Select-Object -First 1
     if ($null -eq $link) {
-        New-GPLink -Name $GpoName -Target $TargetOuDn -LinkEnabled Yes -ErrorAction Stop | Out-Null
+        $linkState = if ($EnableGpoLink) { 'Yes' } else { 'No' }
+        New-GPLink -Name $GpoName -Target $TargetOuDn -LinkEnabled $linkState -ErrorAction Stop | Out-Null
     }
-    elseif (-not $link.Enabled) {
+    elseif ($EnableGpoLink -and -not $link.Enabled) {
         Set-GPLink -Name $GpoName -Target $TargetOuDn -LinkEnabled Yes -ErrorAction Stop | Out-Null
     }
 
@@ -409,114 +411,167 @@ function Set-WinRmHttpsStartupScript {
     $gpoSysvolPath = Join-Path "\\$($domain.PDCEmulator)\SYSVOL\$($domain.DNSRoot)\Policies" $gpoGuidText
     $scriptsDirectory = Join-Path $gpoSysvolPath 'Machine\Scripts'
     $startupDirectory = Join-Path $scriptsDirectory 'Startup'
-    $startupScriptName = 'Configure-WinRmHttps.ps1'
+    $startupScriptName = 'Install-WinRmHttpsTask.ps1'
     $startupScriptPath = Join-Path $startupDirectory $startupScriptName
     New-Item -Path $startupDirectory -ItemType Directory -Force | Out-Null
 
+    # This startup script does only fast local work. It never calls gpupdate,
+    # waits for certificate enrollment, or modifies WSMan during GP processing.
     $startupScript = @'
 # Runs as Local System through computer startup policy.
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
-$logDirectory = Join-Path $env:ProgramData 'Ansible-WinRM'
-$logPath = Join-Path $logDirectory 'Configure-WinRmHttps.log'
-New-Item -Path $logDirectory -ItemType Directory -Force | Out-Null
+$root = Join-Path $env:ProgramData 'Ansible-WinRM'
+$workerPath = Join-Path $root 'Configure-WinRmHttps.ps1'
+$bootstrapLog = Join-Path $root 'Install-WinRmHttpsTask.log'
+$taskName = 'Configure Ansible WinRM HTTPS'
+New-Item -Path $root -ItemType Directory -Force | Out-Null
+
+function Write-BootstrapLog {
+    param([Parameter(Mandatory)][string]$Message)
+    Add-Content -LiteralPath $bootstrapLog -Value ('{0:u} {1}' -f (Get-Date),$Message) -Encoding UTF8
+}
+
+$worker = @"
+Set-StrictMode -Version 2.0
+`$ErrorActionPreference = 'Stop'
+
+`$root = Join-Path `$env:ProgramData 'Ansible-WinRM'
+`$logPath = Join-Path `$root 'Configure-WinRmHttps.log'
+New-Item -Path `$root -ItemType Directory -Force | Out-Null
 
 function Write-SetupLog {
-    param([Parameter(Mandatory)][string]$Message)
-    Add-Content -LiteralPath $logPath -Value ('{0:u} {1}' -f (Get-Date),$Message) -Encoding UTF8
+    param([Parameter(Mandatory)][string]`$Message)
+    Add-Content -LiteralPath `$logPath -Value ('{0:u} {1}' -f (Get-Date),`$Message) -Encoding UTF8
 }
 
 function Test-ServerAuthenticationEku {
-    param([Parameter(Mandatory)][System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate)
-
-    $eku = $Certificate.Extensions | Where-Object { $_.Oid.Value -eq '2.5.29.37' } | Select-Object -First 1
-    if ($null -eq $eku) { return $false }
-
+    param([Parameter(Mandatory)][System.Security.Cryptography.X509Certificates.X509Certificate2]`$Certificate)
+    `$eku = `$Certificate.Extensions | Where-Object { `$_.Oid.Value -eq '2.5.29.37' } | Select-Object -First 1
+    if (`$null -eq `$eku) { return `$false }
     try {
-        $parsed = New-Object System.Security.Cryptography.X509Certificates.X509EnhancedKeyUsageExtension -ArgumentList $eku,$eku.Critical
-        foreach ($usage in $parsed.EnhancedKeyUsages) {
-            if ([string]$usage.Value -eq '1.3.6.1.5.5.7.3.1') { return $true }
+        `$parsed = New-Object System.Security.Cryptography.X509Certificates.X509EnhancedKeyUsageExtension -ArgumentList `$eku,`$eku.Critical
+        foreach (`$usage in `$parsed.EnhancedKeyUsages) {
+            if ([string]`$usage.Value -eq '1.3.6.1.5.5.7.3.1') { return `$true }
         }
     }
     catch {
         try {
-            $text = $eku.Format($false)
-            if ($text -match '1\.3\.6\.1\.5\.5\.7\.3\.1' -or $text -match 'Server Authentication') { return $true }
+            `$text = `$eku.Format(`$false)
+            if (`$text -match '1\.3\.6\.1\.5\.5\.7\.3\.1' -or `$text -match 'Server Authentication') { return `$true }
         }
         catch { }
     }
-    return $false
+    return `$false
 }
 
 function Get-CertificateDnsNames {
-    param([Parameter(Mandatory)][System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate)
-    $names = @()
+    param([Parameter(Mandatory)][System.Security.Cryptography.X509Certificates.X509Certificate2]`$Certificate)
+    `$names = @()
     try {
-        foreach ($item in @($Certificate.DnsNameList)) {
-            if ($null -ne $item -and $item.PSObject.Properties['Unicode']) {
-                $names += [string]$item.Unicode
-            }
+        foreach (`$item in @(`$Certificate.DnsNameList)) {
+            if (`$null -ne `$item -and `$item.PSObject.Properties['Unicode']) { `$names += [string]`$item.Unicode }
         }
     }
     catch { }
-    return @($names | ForEach-Object { $_.TrimEnd('.').ToLowerInvariant() } | Select-Object -Unique)
+    return @(`$names | ForEach-Object { `$_.TrimEnd('.').ToLowerInvariant() } | Select-Object -Unique)
+}
+
+function Find-WinRmCertificate {
+    param([Parameter(Mandatory)][string]`$Fqdn)
+    `$now = Get-Date
+    return Get-ChildItem Cert:\LocalMachine\My |
+        Where-Object {
+            if (-not `$_.HasPrivateKey -or `$_.NotBefore -gt `$now -or `$_.NotAfter -le `$now) { return `$false }
+            if (-not (Test-ServerAuthenticationEku -Certificate `$_)) { return `$false }
+            `$dnsNames = @(Get-CertificateDnsNames -Certificate `$_)
+            `$subjectCn = ''
+            if (`$_.Subject -match '(?:^|,\s*)CN=([^,]+)') { `$subjectCn = `$Matches[1].TrimEnd('.').ToLowerInvariant() }
+            return ((`$dnsNames -contains `$Fqdn) -or (`$subjectCn -eq `$Fqdn))
+        } |
+        Sort-Object NotAfter -Descending |
+        Select-Object -First 1
 }
 
 try {
     Set-Service -Name WinRM -StartupType Automatic
     Start-Service -Name WinRM
 
-    $cs = Get-CimInstance Win32_ComputerSystem
-    if (-not $cs.PartOfDomain) { throw 'Computer is not domain joined.' }
-    $fqdn = ('{0}.{1}' -f $cs.DNSHostName,$cs.Domain).TrimEnd('.').ToLowerInvariant()
+    `$cs = Get-CimInstance Win32_ComputerSystem
+    if (-not `$cs.PartOfDomain) { throw 'Computer is not domain joined.' }
+    `$fqdn = ('{0}.{1}' -f `$cs.DNSHostName,`$cs.Domain).TrimEnd('.').ToLowerInvariant()
 
-    & gpupdate.exe /target:computer /force | Out-Null
+    # Never run gpupdate here. This task is started by Group Policy.
     & certutil.exe -pulse | Out-Null
 
-    $now = Get-Date
-    $certificate = Get-ChildItem Cert:\LocalMachine\My |
-        Where-Object {
-            if (-not $_.HasPrivateKey -or $_.NotBefore -gt $now -or $_.NotAfter -le $now) { return $false }
-            if (-not (Test-ServerAuthenticationEku -Certificate $_)) { return $false }
-            $dnsNames = @(Get-CertificateDnsNames -Certificate $_)
-            $subjectCn = ''
-            if ($_.Subject -match '(?:^|,\s*)CN=([^,]+)') { $subjectCn = $Matches[1].TrimEnd('.').ToLowerInvariant() }
-            return (($dnsNames -contains $fqdn) -or ($subjectCn -eq $fqdn))
-        } |
-        Sort-Object NotAfter -Descending |
-        Select-Object -First 1
+    `$certificate = `$null
+    for (`$attempt = 1; `$attempt -le 6 -and `$null -eq `$certificate; `$attempt++) {
+        `$certificate = Find-WinRmCertificate -Fqdn `$fqdn
+        if (`$null -eq `$certificate) { Start-Sleep -Seconds 20 }
+    }
 
-    if ($null -eq $certificate) {
-        Write-SetupLog "No suitable certificate is available for $fqdn after auto-enrollment pulse."
+    if (`$null -eq `$certificate) {
+        Write-SetupLog "No suitable certificate is available for `$fqdn. The task will retry at the next startup."
         exit 0
     }
 
-    $thumbprint = $certificate.Thumbprint.Replace(' ','').ToUpperInvariant()
+    `$thumbprint = `$certificate.Thumbprint.Replace(' ','').ToUpperInvariant()
     Import-Module Microsoft.WSMan.Management -ErrorAction SilentlyContinue
-    $httpsListeners = @(Get-WSManInstance -ResourceURI 'winrm/config/Listener' -Enumerate -ErrorAction SilentlyContinue | Where-Object { $_.Transport -eq 'HTTPS' })
-    $matching = $httpsListeners | Where-Object {
-        ([string]$_.CertificateThumbprint).Replace(' ','').ToUpperInvariant() -eq $thumbprint -and
-        ([string]$_.Hostname).TrimEnd('.').ToLowerInvariant() -eq $fqdn
+    `$httpsListeners = @(Get-WSManInstance -ResourceURI 'winrm/config/Listener' -Enumerate -ErrorAction SilentlyContinue | Where-Object { [string]`$_.Transport -eq 'HTTPS' })
+    `$matching = `$httpsListeners | Where-Object {
+        ([string]`$_.CertificateThumbprint).Replace(' ','').ToUpperInvariant() -eq `$thumbprint -and
+        ([string]`$_.Hostname).TrimEnd('.').ToLowerInvariant() -eq `$fqdn
     } | Select-Object -First 1
 
-    if ($null -eq $matching) {
-        foreach ($listener in $httpsListeners) {
-            Remove-WSManInstance -ResourceURI 'winrm/config/Listener' -SelectorSet @{ Address=[string]$listener.Address; Transport='HTTPS' } -ErrorAction Stop
+    if (`$null -eq `$matching) {
+        foreach (`$listener in `$httpsListeners) {
+            Remove-WSManInstance -ResourceURI 'winrm/config/Listener' -SelectorSet @{ Address=[string]`$listener.Address; Transport='HTTPS' } -ErrorAction SilentlyContinue
         }
-
-        New-WSManInstance -ResourceURI 'winrm/config/Listener' -SelectorSet @{ Address='*'; Transport='HTTPS' } -ValueSet @{ Hostname=$fqdn; CertificateThumbprint=$thumbprint; Enabled=$true } -ErrorAction Stop | Out-Null
+        New-WSManInstance -ResourceURI 'winrm/config/Listener' -SelectorSet @{ Address='*'; Transport='HTTPS' } -ValueSet @{ Hostname=`$fqdn; CertificateThumbprint=`$thumbprint; Enabled=`$true } -ErrorAction Stop | Out-Null
         Restart-Service WinRM -Force
-        Write-SetupLog "Configured WinRM HTTPS for $fqdn using $thumbprint."
+        Write-SetupLog "Configured WinRM HTTPS for `$fqdn using `$thumbprint."
     }
     else {
-        Write-SetupLog "Existing WinRM HTTPS listener already uses $thumbprint."
+        Write-SetupLog "Existing WinRM HTTPS listener already uses `$thumbprint."
     }
 }
 catch {
-    Write-SetupLog "ERROR: $($_.Exception.Message)"
-    throw
+    Write-SetupLog "ERROR: `$(`$_.Exception.Message)"
+    exit 1
 }
+"@
+
+try {
+    Set-Content -LiteralPath $workerPath -Value $worker -Encoding UTF8 -Force
+
+    $action = New-ScheduledTaskAction `
+        -Execute "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
+        -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$workerPath`""
+    $trigger = New-ScheduledTaskTrigger -AtStartup
+    $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+    $settings = New-ScheduledTaskSettingsSet `
+        -StartWhenAvailable `
+        -ExecutionTimeLimit (New-TimeSpan -Minutes 10) `
+        -MultipleInstances IgnoreNew
+
+    Register-ScheduledTask `
+        -TaskName $taskName `
+        -Action $action `
+        -Trigger $trigger `
+        -Principal $principal `
+        -Settings $settings `
+        -Force | Out-Null
+
+    Start-ScheduledTask -TaskName $taskName
+    Write-BootstrapLog 'Scheduled task installed and started asynchronously.'
+}
+catch {
+    Write-BootstrapLog "ERROR: $($_.Exception.Message)"
+}
+
+# Always return successfully so startup policy cannot hold the boot sequence.
+exit 0
 '@
 
     Set-Content -LiteralPath $startupScriptPath -Value $startupScript -Encoding UTF8
@@ -529,19 +584,19 @@ catch {
     $scriptsCse = '{42B5FAAE-6536-11D2-AE5A-0000F87571E3}'
     $scriptsTool = '{40B6664F-4972-11D1-A7CA-0000F87571E3}'
     $extensionPair = "[$scriptsCse$scriptsTool]"
-    $gpoAdObject = Get-ADObject -Identity $gpoAdPath -Properties gPCMachineExtensionNames,versionNumber -ErrorAction Stop
+    $gpoAdObject = Get-ADObject -Identity $gpoAdPath -Server $domain.PDCEmulator -Properties gPCMachineExtensionNames,versionNumber -ErrorAction Stop
     $extensionNames = [string]$gpoAdObject.gPCMachineExtensionNames
 
     if ($extensionNames -notlike "*$scriptsCse*") {
         $pairs = @([regex]::Matches($extensionNames,'\[[^\]]+\]') | ForEach-Object { $_.Value })
         $pairs += $extensionPair
         $extensionNames = ($pairs | Sort-Object -Unique) -join ''
-        Set-ADObject -Identity $gpoAdPath -Replace @{ gPCMachineExtensionNames=$extensionNames } -ErrorAction Stop
+        Set-ADObject -Identity $gpoAdPath -Server $domain.PDCEmulator -Replace @{ gPCMachineExtensionNames=$extensionNames } -ErrorAction Stop
     }
 
     $currentVersion = [int64]$gpoAdObject.versionNumber
     $newVersion = $currentVersion + 65536
-    Set-ADObject -Identity $gpoAdPath -Replace @{ versionNumber=$newVersion } -ErrorAction Stop
+    Set-ADObject -Identity $gpoAdPath -Server $domain.PDCEmulator -Replace @{ versionNumber=$newVersion } -ErrorAction Stop
     @"
 [General]
 Version=$newVersion
@@ -617,7 +672,16 @@ Write-Host "Template:         $TemplateDisplayName ($TemplateInternalName)"
 Write-Host "Enrollment group: $($enrollmentGroup.SamAccountName)"
 Write-Host "GPO:              $GpoName"
 Write-Host ''
-Write-Host 'Restart the SharePoint nodes (required for new computer-group membership tokens), then run:' -ForegroundColor Yellow
-Write-Host '  gpupdate.exe /force'
-Write-Host '  certutil.exe -pulse'
+if ($EnableGpoLink) {
+    Write-Host 'The GPO link is enabled. Restart one SharePoint node first and verify it boots normally.' -ForegroundColor Yellow
+}
+else {
+    Write-Host 'The GPO link remains disabled. Review the changes, then rerun with -EnableGpoLink.' -ForegroundColor Yellow
+}
+Write-Host 'Node configuration runs asynchronously through the scheduled task: Configure Ansible WinRM HTTPS'
 Write-Host ''
+
+.\Deploy-SharePoint-WinRM-HTTPS-Holistic-v2.ps1 `
+    -TargetOuDn "OU=Sharepoint,OU=Servers,DC=contoso,DC=com" `
+    -WinRmIPv4Filter "*" `
+    -EnableGpoLink

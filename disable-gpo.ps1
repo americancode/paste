@@ -1,6 +1,6 @@
 Import-Module GroupPolicy
 
 Set-GPLink `
-    -Name 'Servers - SharePoint' `
-    -Target 'OU=Sharepoint,OU=Servers,DC=yourdomain,DC=com' `
+    -Name 'Servers - Sharepoint' `
+    -Target 'OU=Sharepoint,OU=Servers,DC=compy,DC=local' `
     -LinkEnabled No
